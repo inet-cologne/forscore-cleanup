@@ -1,0 +1,31 @@
+# forScore data files (personal data - not in repo)
+*.4sb
+*.json
+*.plist
+*.db
+*.db.*
+*.csv
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Output directories created by scripts
+*/artefacts/
+mobilesheets_export/
+original/
+untouched/
+duplicated/
+db/
+csv/
+
+# Exception: keep sample/example files if added later
+!sample.json
