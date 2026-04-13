@@ -19,6 +19,8 @@ venv/
 .DS_Store
 
 # Output directories created by scripts
+Archiv*/
+Backup*/
 */artefacts/
 mobilesheets_export/
 original/

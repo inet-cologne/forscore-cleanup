@@ -95,6 +95,93 @@ python3 analyze_forscore_backup.py "Backup 2026-01-03.4sb"
 
 Outputs a JSON file with the extracted plist data and bookmark statistics.
 
+### `extract_binaries_forscore_backup.py`
+
+Extracts all embedded files (PDFs, audio, PNG drawings, etc.) from a forScore
+Archive file (`.4sb` V03) into a local directory. Useful for inspecting archive
+contents or recovering individual files without doing a full restore.
+
+```bash
+python3 extract_binaries_forscore_backup.py "Archiv 2026-04-12 16-00-52.4sb"
+```
+
+Output is written to `Archiv 2026-04-12 16-00-52/files/` next to the input file.
+
+```bash
+# Custom output base directory
+python3 extract_binaries_forscore_backup.py "Archiv 2026-04-12 16-00-52.4sb" -o /tmp/out
+
+# Show each filename as it is extracted
+python3 extract_binaries_forscore_backup.py "Archiv 2026-04-12 16-00-52.4sb" -v
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output-dir` | Base output directory (default: `<stem>/` next to input file) |
+| `-v, --verbose` | Print each extracted filename |
+
+**Output directory layout:**
+
+```
+Archiv 2026-04-12 16-00-52/
+└── files/
+    ├── Real Book (Bb) Vol.1.pdf
+    ├── My Song.mp3
+    ├── artifact_00001.png   ← fallback name when gzip FNAME is absent
+    └── ...
+```
+
+Filenames are taken from the `FNAME` field in each gzip block's header when
+available. If absent, the file type is detected from magic bytes and a
+zero-padded counter is used (`artifact_00001.pdf`, etc.).
+
+Only accepts files whose name starts with `Archiv` and whose header contains
+the V03 marker `<--4SBV03-->`. Exits with an error otherwise.
+
+The summaary output of the script looks like this:
+
+```bash
+python3 extract_binaries_forscore_backup.py Archiv\ 2026-04-12\ 16-00-52.4sb
+Started:  18:53:58
+Input:    Archiv 2026-04-12 16-00-52.4sb (28.1 GB)
+Output:   /Users/cwa/developer/opencode/forscore/Archiv 2026-04-12 16-00-52/files
+
+Metadata: 3.1 MB  |  Payload: 28.1 GB
+
+Phase 1 — Counting records...
+Scan complete.  5786 records found  (0s, 189.9 GB/s)
+
+Phase 2 — Extracting 5786 records...
+[================>                  ] 2702/5786 (46%)  270.3 MB/s  ETA 46s  ok=2702 skip=0
+  [18:54:59  1m 00s elapsed]  2702/5786 processed  2702 extracted  0 skipped  15.8 GB read
+[===================================] 5786/5786 (100%)  done in 1m 46s  ok=5786 skip=0
+
+====================================================
+SUMMARY
+====================================================
+  Started:           18:53:58
+  Finished:          18:55:45
+  Duration:          1m 46s
+
+  Blocks scanned:      5786
+  Files extracted:     5786
+  Skipped (corrupt):      0
+
+  By file type:
+    .mp3            3582
+    .pdf            1281
+    .png             898
+    .m4a              14
+    .csv               7
+    .wav               2
+    .mid               2
+====================================================
+  Output: /Users/cwa/developer/opencode/forscore/Archiv 2026-04-12 16-00-52/files
+====================================================
+```
+
 ### `clean_forscore_bookmarks.py`
 
 The main script. Removes duplicate bookmarks from a `.4sb` file and creates a cleaned version.
