@@ -1,816 +1,763 @@
 #!/usr/bin/env python3
 """
-Clean duplicate bookmarks from forScore .4sb backup and archive files.
+Clean duplicate bookmarks from a forScore .4sb Backup (V02) or Archive (V03) file
+while preserving all embedded binary records (PDFs, MP3s, draw-annotation PNGs).
 
-This script:
-1. Extracts data from a .4sb backup/archive file
-2. Identifies duplicate bookmarks
-3. Removes duplicates
-4. Creates a cleaned .4sb backup/archive file
-5. For archive files: Extracts embedded files (PDFs, MP3s, etc.) and re-embeds them
+Key improvement over v1
+-----------------------
+v1 silently discarded all embedded-file records after writing the cleaned metadata,
+which destroyed draw annotations (ink strokes stored as PNG per page).
+
+v2 copies every record byte-for-byte from the original file into the output file.
+Because the record filename format encodes both the PDF name and the page number
+(<pdfname>|<page>.png), the association between drawings and scores remains valid
+after deduplication: dedup only removes bookmark *entries* in the plist -- the PDF
+filenames themselves never change.
+
+Supported file types
+--------------------
+  V02 Backup  (Backup*.4sb) -- metadata plist + PNG draw annotations only
+  V03 Archive (Archiv*.4sb) -- metadata plist + PDFs + audio files + PNG annotations
+
+Output
+------
+  <output_dir>/<input_stem>-cleaned.4sb
+
+  Default output directory: <input_stem>/ next to the input file.
+
+Usage
+-----
+  clean_forscore_bookmarks_v2.py <input.4sb> [-o OUTPUT_DIR]
+                                 [--dry-run]
+                                 [-m | --merge-meta]
+                                 [--page2item]
+                                 [--last-page-fix]
+                                 [--no-dedup]
 """
 
-import struct
-import zlib
-import plistlib
-import json
-import sys
-import os
-import shutil
-from pathlib import Path
-from collections import defaultdict
 import argparse
 import gzip
 import io
+import json
+import os
+import plistlib
 import re
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 
 
-def detect_file_type(filepath):
-    """Detect if file is Backup or Archive based on filename and header."""
-    filename = Path(filepath).name
-    is_archive = filename.startswith('Archiv')
-    is_backup = filename.startswith('Backup')
-    
-    # Also check header version
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+HEADER_SIZE        = 74          # fixed ASCII file header
+NUMERIC_PREFIX_LEN = 32          # fixed-width numeric prefix in each record header
+DOCUMENTS_PREFIX   = '{%DOCUMENTS_DIR%}/'
+AUX_PREFIX         = '{%AUX_DIR%}/'
+
+
+# ---------------------------------------------------------------------------
+# Progress-display helpers (shared with extract_binaries_forscore_backup.py)
+# ---------------------------------------------------------------------------
+def _fmt_bytes(n: float) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024:
+            return f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} TB'
+
+
+def _fmt_speed(bps: float) -> str:
+    return _fmt_bytes(int(bps)) + '/s'
+
+
+def _fmt_eta(seconds: float) -> str:
+    if seconds < 0 or seconds > 86400 * 2:
+        return '--:--'
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f'{h}h {m:02d}m {s:02d}s'
+    if m:
+        return f'{m}m {s:02d}s'
+    return f'{s}s'
+
+
+def _now() -> str:
+    return datetime.now().strftime('%H:%M:%S')
+
+
+def _clear_line():
+    sys.stdout.write('\r\033[K')
+
+
+def _bar(current: int, total: int, width: int = 35) -> str:
+    if total == 0:
+        pct, filled = 100, width
+    else:
+        pct    = int(100 * current / total)
+        filled = int(width * current / total)
+    arrow  = '>' if filled < width else ''
+    spaces = width - filled - len(arrow)
+    bar    = '=' * filled + arrow + ' ' * spaces
+    return f'[{bar}] {current}/{total} ({pct}%)'
+
+
+# ---------------------------------------------------------------------------
+# forScore file-header parsing
+# ---------------------------------------------------------------------------
+def read_file_header(filepath: str) -> dict:
+    """
+    Read and parse the 74-byte ASCII file header.
+
+    Returns a dict with keys:
+        version             - '4SBV02' or '4SBV03'
+        is_archive          - True for V03
+        is_backup           - True for V02
+        metadata_size       - byte length of the metadata gzip block
+        metadata_end        - byte offset where the record section begins
+        raw                 - the raw 74-byte header bytes
+        filename_in_header  - original filename embedded in the header
+    """
     with open(filepath, 'rb') as f:
-        header = f.read(100)
-    
-    header_str = header.decode('utf-8', errors='ignore')
-    is_v03 = '<--4SBV03-->' in header_str
-    is_v02 = '<--4SBV02-->' in header_str
-    
-    # V03 is typically Archive, V02 is typically Backup
-    if is_v03 and not is_backup:
-        is_archive = True
-    elif is_v02 and not is_archive:
-        is_backup = True
-    
+        raw = f.read(HEADER_SIZE)
+    text = raw.decode('ascii', errors='replace')
+
+    m = re.search(r'(\d{5,12})(Backup|Archiv)', text)
+    if not m:
+        raise ValueError(f"Cannot parse metadata size from file header: {text!r}")
+
+    metadata_size = int(m.group(1))
+    metadata_end  = HEADER_SIZE + metadata_size
+
+    version_match = re.search(r'4SBV0[23]', text)
+    version       = version_match.group(0) if version_match else 'Unknown'
+
+    fn_match = re.search(r'(?:Backup|Archiv).*', text)
+    filename_in_header = fn_match.group(0).strip() if fn_match else ''
+
     return {
-        'is_archive': is_archive,
-        'is_backup': is_backup,
-        'version': 'V03' if is_v03 else 'V02' if is_v02 else 'Unknown'
+        'version':            version,
+        'is_archive':         version == '4SBV03',
+        'is_backup':          version == '4SBV02',
+        'metadata_size':      metadata_size,
+        'metadata_end':       metadata_end,
+        'raw':                raw,
+        'filename_in_header': filename_in_header,
     }
 
 
-def calculate_gzip_header_size(data, offset):
-    """Calculate the size of a gzip header starting at offset."""
-    if data[offset:offset+2] != b'\x1f\x8b':
+def rebuild_header(original_raw: bytes, new_metadata_size: int) -> bytes:
+    """
+    Return a new 74-byte header identical to original_raw except the metadata
+    size field is updated.  Header length (74 bytes) is preserved exactly.
+    """
+    text = original_raw.decode('ascii', errors='replace')
+    m    = re.search(r'(\d{5,12})(Backup|Archiv)', text)
+    if not m:
+        return original_raw   # cannot rewrite; return original unchanged
+
+    old_str = m.group(1)
+    new_str = str(new_metadata_size)
+
+    # Right-align within the same character width as original
+    padded   = new_str.rjust(len(old_str)) if len(new_str) <= len(old_str) else new_str
+    new_text = text[:m.start(1)] + padded + text[m.end(1):]
+
+    # Truncate or pad to exactly HEADER_SIZE bytes
+    encoded = new_text.encode('ascii', errors='replace')
+    if len(encoded) < HEADER_SIZE:
+        encoded = encoded + b' ' * (HEADER_SIZE - len(encoded))
+    elif len(encoded) > HEADER_SIZE:
+        encoded = encoded[:HEADER_SIZE]
+    return encoded
+
+
+# ---------------------------------------------------------------------------
+# Metadata (plist) extraction
+# ---------------------------------------------------------------------------
+def read_plist(filepath: str, metadata_end: int) -> dict:
+    """Read and decompress the metadata block; return the parsed plist dict."""
+    metadata_size = metadata_end - HEADER_SIZE
+    with open(filepath, 'rb') as f:
+        f.seek(HEADER_SIZE)
+        gz_bytes = f.read(metadata_size)
+    raw_plist = gzip.decompress(gz_bytes)
+    if raw_plist[:8] != b'bplist00':
+        raise ValueError("Metadata block is not an Apple Binary plist (bplist00).")
+    return plistlib.loads(raw_plist)
+
+
+def compress_plist(plist: dict) -> bytes:
+    """Serialize and gzip-compress a plist dict.  Returns compressed bytes."""
+    raw = plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=9) as gz:
+        gz.write(raw)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Record-header parsing (sequential, no magic-byte scan)
+# ---------------------------------------------------------------------------
+def parse_record_header(filepath: str, pos: int) -> dict | None:
+    """
+    Read and parse the ASCII record header at `pos`.
+
+    Returns a dict with:
+        raw_header      - raw bytes from pos up to (not including) the gzip magic
+        filename        - decoded filename (path prefixes stripped)
+        raw_filename    - full filename as it appears in the record header
+        compressed_size - byte length of the gzip data block
+        gzip_start      - absolute file offset of the gzip magic bytes
+        next_pos        - absolute offset of the next record header
+
+    Returns None at end-of-file or if no gzip marker is found.
+    """
+    with open(filepath, 'rb') as f:
+        f.seek(pos)
+        buf = f.read(512)
+
+    if not buf:
         return None
-    
-    method = data[offset+2]
-    flags = data[offset+3]
-    
-    header_size = 10
-    if flags & 0x04:  # FEXTRA
-        if len(data) > offset + header_size + 2:
-            extra_len = struct.unpack('<H', data[offset+header_size:offset+header_size+2])[0]
-            header_size += 2 + extra_len
-    if flags & 0x08:  # FNAME
-        name_end = data.find(b'\x00', offset + header_size)
-        if name_end != -1:
-            header_size = name_end - offset + 1
-    if flags & 0x10:  # FCOMMENT
-        comment_end = data.find(b'\x00', offset + header_size)
-        if comment_end != -1:
-            header_size = comment_end - offset + 1
-    if flags & 0x02:  # FHCRC
-        header_size += 2
-    
-    return header_size
 
+    gz_idx = buf.find(b'\x1f\x8b\x08')
+    if gz_idx == -1:
+        return None
 
-def find_gzip_block_end(filepath, gzip_start, max_search=100*1024*1024):
-    """Find the end of a gzip block by reading and decompressing it."""
-    header_size = None
-    with open(filepath, 'rb') as f:
-        f.seek(gzip_start)
-        header_data = f.read(100)
-        header_size = calculate_gzip_header_size(header_data, 0)
-        if header_size is None:
-            return None
-    
-    compressed_start = gzip_start + header_size
-    
-    # Use gzip module to read the block - it will stop at the end
-    with open(filepath, 'rb') as f:
-        f.seek(gzip_start)
-        try:
-            with gzip.GzipFile(fileobj=f, mode='rb') as gz:
-                # Read all data - this will position us at the end of the gzip block
-                gz.read()
-                # Get current position
-                gzip_end = f.tell()
-                return gzip_end
-        except Exception:
-            # Fallback: look for next gzip magic
-            f.seek(compressed_start + 1000)
-            chunk = f.read(min(max_search, 10*1024*1024))
-            next_gzip = chunk.find(b'\x1f\x8b\x08')
-            if next_gzip != -1:
-                return compressed_start + 1000 + next_gzip
-            return None
+    header_text = buf[:gz_idx].decode('latin-1', errors='replace')
 
+    # compressed_size is the last number in the fixed 32-char numeric prefix
+    numeric_part = header_text[:NUMERIC_PREFIX_LEN]
+    nums         = re.findall(r'\d+', numeric_part)
+    if not nums:
+        return None
+    compressed_size = int(nums[-1])
 
-def extract_4sb_file(filepath, extract_artifacts=False, artifacts_dir=None, return_artifacts_data=False):
-    """Extract and parse a .4sb backup/archive file."""
-    print(f"Extracting: {filepath}")
-    
-    file_type = detect_file_type(filepath)
-    print(f"File type: {'Archive' if file_type['is_archive'] else 'Backup'} (Version: {file_type['version']})")
-    
-    file_size = os.path.getsize(filepath)
-    print(f"File size: {file_size:,} bytes ({file_size / (1024**3):.2f} GB)")
-    
-    # Read the 74-byte ASCII header
-    with open(filepath, 'rb') as f:
-        header_bytes = f.read(74)
-    
-    # Parse header to get metadata size
-    # Format: <--4SBV02-->              30         1367604Backup...
-    # The metadata size is an ASCII number before "Backup" or "Archiv"
-    import re
-    header_str = header_bytes.decode('ascii')
-    match = re.search(r'(\d{5,10})(Backup|Archiv)', header_str)
-    if not match:
-        raise ValueError("Could not parse metadata size from header")
-    
-    metadata_size_from_header = int(match.group(1))
-    print(f"Header indicates metadata size: {metadata_size_from_header:,} bytes")
-    
-    # Calculate where metadata ends and additional data begins
-    # Header is 74 bytes, then comes metadata
-    metadata_start = 74
-    metadata_end = metadata_start + metadata_size_from_header
-    
-    # For large files, we need to read in chunks
-    # But for metadata, we can read a reasonable chunk first
-    with open(filepath, 'rb') as f:
-        # Read first 100MB to get metadata
-        initial_data = f.read(100 * 1024 * 1024)
-    
-    # Find first gzip magic number (metadata)
-    offset = initial_data.find(b'\x1f\x8b\x08')
-    if offset == -1:
-        raise ValueError("Gzip magic number not found")
-    
-    if offset != 74:
-        print(f"Warning: Gzip starts at {offset}, expected 74")
-    
-    header = initial_data[:offset]
-    
-    # The FIRST gzip block contains the actual metadata (plist)
-    # Find its extent by decompressing
-    # But for reading additional data, use metadata_end from header!
-    with open(filepath, 'rb') as f:
-        f.seek(offset)
-        # Read a reasonable chunk to get the first gzip block
-        first_gzip_data = f.read(min(metadata_size_from_header, 50 * 1024 * 1024))
-    
-    # Decompress the first gzip block to get the plist
-    # Try to decompress just the first stream
-    try:
-        decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
-        decompressed = decompressor.decompress(first_gzip_data[10:])  # Skip gzip header (10 bytes)
-        # Note: decompressor.unused_data contains any data after the first stream
-    except Exception as e:
-        raise ValueError(f"Could not decompress metadata: {e}")
-    
-    # Parse plist
-    if decompressed[:8] != b'bplist00':
-        raise ValueError("Unsupported format - not a binary plist")
-    
-    plist = plistlib.loads(decompressed)
-    
-    result = {
-        'header': header,
-        'gzip_header': b'',  # Not needed separately anymore
-        'data': plist,
-        'file_type': file_type,
-        'metadata_start': metadata_start,
-        'metadata_end': metadata_end,
-        'filepath': filepath,
-        'file_size': file_size
+    # Full filename (with any prefix intact) starts at character 32
+    raw_filename = header_text[NUMERIC_PREFIX_LEN:].strip() or None
+
+    # Strip known path prefixes for the clean filename
+    filename = raw_filename
+    if filename:
+        if filename.startswith(DOCUMENTS_PREFIX):
+            filename = filename[len(DOCUMENTS_PREFIX):]
+        elif filename.startswith(AUX_PREFIX):
+            filename = filename[len(AUX_PREFIX):]
+
+    gzip_start = pos + gz_idx
+    return {
+        'raw_header':      buf[:gz_idx],
+        'filename':        filename,
+        'raw_filename':    raw_filename,
+        'compressed_size': compressed_size,
+        'gzip_start':      gzip_start,
+        'next_pos':        gzip_start + compressed_size,
     }
-    
-    # Extract artifacts if requested and this is an archive
-    artifacts_data = None
-    if file_type['is_archive']:
-        if extract_artifacts and artifacts_dir:
-            # Extract files to directory
-            extract_artifacts_from_archive(filepath, metadata_gzip_end, artifacts_dir)
-        
-        # Always read artifacts data if we need to return it (for re-embedding)
-        if return_artifacts_data:
-            artifacts_data = read_artifacts_data(filepath, metadata_gzip_end)
-    
-    if return_artifacts_data and artifacts_data:
-        result['artifacts_data'] = artifacts_data
-    
+
+
+def count_records(filepath: str, start_pos: int, file_size: int) -> int:
+    """Walk all record headers and return the total count (fast: headers only)."""
+    pos   = start_pos
+    count = 0
+    t0    = time.monotonic()
+
+    while pos < file_size:
+        rec = parse_record_header(filepath, pos)
+        if rec is None:
+            break
+        count += 1
+        pos    = rec['next_pos']
+
+        elapsed = time.monotonic() - t0
+        pct     = int(100 * pos / file_size)
+        speed   = (pos - start_pos) / elapsed if elapsed > 0 else 0
+        eta     = (file_size - pos) / speed   if speed  > 0 else 0
+        _clear_line()
+        sys.stdout.write(
+            f'  Scanning...  {pct:3d}%  {_fmt_bytes(pos)}/{_fmt_bytes(file_size)}'
+            f'  {_fmt_speed(speed)}  ETA {_fmt_eta(eta)}  --  {count} records'
+        )
+        sys.stdout.flush()
+
+    elapsed = time.monotonic() - t0
+    _clear_line()
+    speed_avg = (file_size - start_pos) / elapsed if elapsed > 0 else 0
+    print(f'  Scan done: {count} records  ({_fmt_eta(elapsed)}, {_fmt_speed(speed_avg)})')
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Bookmark cleaning (identical logic to v1, re-implemented cleanly)
+# ---------------------------------------------------------------------------
+def find_bookmark_lists(plist: dict) -> list:
+    """
+    Return all dicts describing every '|bookmarks' key found.
+    Setlist keys (&SET;...) and other non-bookmark keys are excluded.
+    """
+    result = []
+    for key, value in plist.items():
+        if key.endswith('|bookmarks') and isinstance(value, list):
+            result.append({'parent': plist, 'key': key, 'bookmarks': value})
     return result
 
 
-def read_artifacts_data(filepath, metadata_end):
-    """Read all data after metadata (artifacts) from archive file.
-    
-    Artifacts are stored as gzip blocks. We read them as-is to preserve the format.
+def _bookmark_dedup_key(bm: dict) -> tuple:
+    return (bm.get('FilePath', ''), bm.get('First Page', 0), bm.get('Title', ''))
+
+
+def deduplicate_bookmarks(bookmark_list: list, merge_meta: bool = False) -> tuple:
     """
-    file_size = os.path.getsize(filepath)
-    artifacts_size = file_size - metadata_end
-    
-    print(f"Reading artifacts data: {artifacts_size:,} bytes ({artifacts_size / (1024**3):.2f} GB)")
-    
-    # Simply read all data after metadata_end - this preserves the gzip block structure
-    with open(filepath, 'rb') as f:
-        f.seek(metadata_end)
-        artifacts_data = f.read()
-    
-    print(f"✓ Read {len(artifacts_data):,} bytes of artifacts data")
-    return artifacts_data
-
-
-def extract_artifacts_from_archive(filepath, metadata_end, artifacts_dir):
-    """Extract embedded files from archive.
-    
-    Files in archive are stored in separate gzip blocks after the metadata block.
-    Each gzip block contains one file (PDF, MP3, etc.).
+    Remove duplicates from a flat bookmark list.
+    Returns (unique_list, n_removed).
+    If merge_meta=True, missing fields in the kept entry are filled from duplicates.
     """
-    print(f"\nExtracting artifacts from archive...")
-    print(f"Metadata ends at offset: {metadata_end:,}")
-    
-    file_size = os.path.getsize(filepath)
-    artifacts_size = file_size - metadata_end
-    print(f"Artifacts size: {artifacts_size:,} bytes ({artifacts_size / (1024**3):.2f} GB)")
-    
-    artifacts_dir = Path(artifacts_dir)
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    
-    # File signatures to detect file type after decompression
-    file_signatures = {
-        b'%PDF': '.pdf',
-        b'ID3': '.mp3',
-        b'\xff\xfb': '.mp3',
-        b'\x89PNG': '.png',
-        b'GIF8': '.gif',
-        b'\xff\xd8\xff': '.jpg',
-        b'PK\x03\x04': '.zip',  # ZIP file
-    }
-    
-    extracted_count = 0
-    
-    print("Finding all gzip blocks containing files...")
-    
-    # First, find all gzip block positions
-    gzip_positions = []
-    chunk_size = 100 * 1024 * 1024  # 100MB chunks
-    current_pos = metadata_end
-    
-    print("  Scanning for gzip blocks...")
-    with open(filepath, 'rb') as f:
-        while current_pos < file_size:
-            f.seek(current_pos)
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            
-            # Find all gzip magic numbers in this chunk
-            offset = 0
-            while True:
-                pos = chunk.find(b'\x1f\x8b\x08', offset)
-                if pos == -1:
-                    break
-                gzip_abs_pos = current_pos + pos
-                gzip_positions.append(gzip_abs_pos)
-                offset = pos + 1
-            
-            current_pos += chunk_size - 1000  # Overlap to catch blocks at boundaries
-    
-    print(f"  Found {len(gzip_positions)} gzip blocks")
-    
-    # Now extract each gzip block
-    print("  Extracting files from gzip blocks...")
-    for i, gzip_pos in enumerate(gzip_positions):
-        try:
-            with open(filepath, 'rb') as gz_file:
-                gz_file.seek(gzip_pos)
-                with gzip.GzipFile(fileobj=gz_file, mode='rb') as gz:
-                    decompressed = gz.read()
-                    
-                    # Determine file type
-                    file_ext = None
-                    for sig, ext in file_signatures.items():
-                        if decompressed.startswith(sig):
-                            file_ext = ext
-                            break
-                    
-                    if file_ext is None:
-                        file_ext = '.bin'  # Default extension
-                    
-                    # Save file
-                    filename = f"artifact_{extracted_count:05d}{file_ext}"
-                    filepath_out = artifacts_dir / filename
-                    with open(filepath_out, 'wb') as out_f:
-                        out_f.write(decompressed)
-                    
-                    extracted_count += 1
-                    if extracted_count % 50 == 0:
-                        print(f"    Extracted {extracted_count}/{len(gzip_positions)} files...")
-        
-        except Exception as e:
-            # Skip invalid gzip blocks
-            continue
-    
-    print(f"✓ Extracted {extracted_count} artifact files to {artifacts_dir}")
-    return extracted_count
+    seen      = {}
+    unique    = []
+    n_removed = 0
+    IDENTITY_FIELDS = {'FilePath', 'First Page', 'Last Page', 'Title', 'Identifier'}
 
-
-def read_file_chunk(filepath, start, size):
-    """Read a chunk of a file."""
-    with open(filepath, 'rb') as f:
-        f.seek(start)
-        return f.read(size)
-
-
-def find_all_bookmarks(plist_data, path=""):
-    """Recursively find all bookmark lists in the plist structure.
-
-    Only keys ending in '|bookmarks' are treated as bookmark lists.
-    Setlist keys (&SET;...) and other lists that happen to contain
-    dicts with 'FilePath'/'Title' fields are explicitly excluded to
-    avoid accidentally deduplicating setlist entries.
-    """
-    bookmark_lists = []
-    
-    if isinstance(plist_data, dict):
-        for key, value in plist_data.items():
-            current_path = f"{path}.{key}" if path else key
-            # Only consider keys that are actual bookmark lists
-            if key.endswith('|bookmarks') and isinstance(value, list):
-                bookmark_lists.append({
-                    'path': current_path,
-                    'parent': plist_data,
-                    'key': key,
-                    'bookmarks': value
-                })
-            # Recurse into nested structures, but not into setlists or bookmark lists
-            elif not key.startswith('&SET;') and not key.endswith('|bookmarks'):
-                bookmark_lists.extend(find_all_bookmarks(value, current_path))
-    elif isinstance(plist_data, list):
-        for i, item in enumerate(plist_data):
-            bookmark_lists.extend(find_all_bookmarks(item, f"{path}[{i}]"))
-    
-    return bookmark_lists
-
-
-def create_bookmark_key(bookmark):
-    """Create a unique key for a bookmark to identify duplicates."""
-    file_path = bookmark.get('FilePath', '')
-    first_page = bookmark.get('First Page', 0)
-    title = bookmark.get('Title', '')
-    return (file_path, first_page, title)
-
-
-def remove_duplicate_bookmarks(bookmark_list, merge_meta=False):
-    """Remove duplicate bookmarks from a list.
-
-    By default, keeps the first occurrence of each logical bookmark.
-    If merge_meta=True, metadata from later duplicates is merged into the
-    first occurrence (only filling missing/empty fields).
-    """
-    seen = {}
-    unique_bookmarks = []
-    duplicates = []
-    
-    for bookmark in bookmark_list:
-        key = create_bookmark_key(bookmark)
-        
+    for bm in bookmark_list:
+        key = _bookmark_dedup_key(bm)
         if key in seen:
-            original = seen[key]
-
-            # Optionally merge metadata from duplicate into the original
-            if merge_meta and isinstance(bookmark, dict) and isinstance(original, dict):
-                for field, value in bookmark.items():
-                    # Skip core identity fields
-                    if field in {"FilePath", "First Page", "Last Page", "Title", "Identifier"}:
+            if merge_meta and isinstance(bm, dict) and isinstance(seen[key], dict):
+                for field, value in bm.items():
+                    if field in IDENTITY_FIELDS:
                         continue
-
-                    # Consider value "missing" if None or empty string in original
-                    if field not in original or original.get(field) in (None, ""):
-                        if value not in (None, ""):
-                            original[field] = value
-
-            duplicates.append({
-                'original': original,
-                'duplicate': bookmark,
-                'key': key
-            })
+                    if seen[key].get(field) in (None, ''):
+                        if value not in (None, ''):
+                            seen[key][field] = value
+            n_removed += 1
         else:
-            seen[key] = bookmark
-            unique_bookmarks.append(bookmark)
-    
-    return unique_bookmarks, duplicates
+            seen[key] = bm
+            unique.append(bm)
+
+    return unique, n_removed
 
 
-def convert_page_to_item_bookmarks(plist_data):
-    """Convert Page Bookmarks (Last Page = 0) to Item Bookmarks.
-    
-    Page Bookmarks are simple navigation markers with minimal metadata.
-    Item Bookmarks are treated like virtual scores with full metadata.
-    
-    This function:
-    1. Sets Last Page = First Page for single-page bookmarks
-    2. Copies metadata from the score level (Genre, Composer, Keyword, etc.)
+def fix_last_page(plist: dict) -> int:
+    """Set Last Page = First Page wherever Last Page == 0.  Returns fix count."""
+    count = 0
+    for key, value in plist.items():
+        if not key.endswith('|bookmarks') or not isinstance(value, list):
+            continue
+        for bm in value:
+            if isinstance(bm, dict) and bm.get('Last Page') == 0:
+                bm['Last Page'] = bm.get('First Page', 0)
+                count += 1
+    return count
+
+
+def copy_score_meta_to_bookmarks(plist: dict) -> int:
     """
-    fixed_count = 0
-    
-    def process_dict(obj, score_metadata=None):
-        nonlocal fixed_count
-        
-        if isinstance(obj, dict):
-            # Check if this is a bookmarks list
-            for key, value in list(obj.items()):
-                if key.endswith('|bookmarks') and isinstance(value, list):
-                    # Extract the FilePath from the key
-                    filepath = key.replace('|bookmarks', '')
-                    
-                    # Get score-level metadata for this file
-                    score_meta = {}
-                    for meta_key in ['composer', 'genre', 'keywords', 'key', 'bpm', 'signature']:
-                        meta_full_key = f"{filepath}|{meta_key}"
-                        if meta_full_key in obj:
-                            # Map to bookmark field names (capitalized)
-                            bookmark_field = meta_key.capitalize() if meta_key != 'keywords' else 'Keyword'
-                            bookmark_field = 'Key' if meta_key == 'key' else bookmark_field
-                            bookmark_field = 'BPM' if meta_key == 'bpm' else bookmark_field
-                            bookmark_field = 'Signature' if meta_key == 'signature' else bookmark_field
-                            score_meta[bookmark_field] = obj[meta_full_key]
-                    
-                    # Process each bookmark
-                    for bookmark in value:
-                        if isinstance(bookmark, dict):
-                            last_page = bookmark.get('Last Page', None)
-                            first_page = bookmark.get('First Page', None)
-                            
-                            # Check if it's a Page Bookmark (Last Page = 0)
-                            if last_page == 0 and first_page is not None:
-                                # Convert to Item Bookmark
-                                bookmark['Last Page'] = first_page
-                                
-                                # Copy score-level metadata to bookmark
-                                for field, value in score_meta.items():
-                                    if field not in bookmark:
-                                        bookmark[field] = value
-                                
-                                fixed_count += 1
-                
-                # Recurse into nested structures
-                elif isinstance(value, (dict, list)):
-                    process_dict(value, score_metadata)
-        
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, (dict, list)):
-                    process_dict(item, score_metadata)
-    
-    process_dict(plist_data)
-    return plist_data, fixed_count
-
-
-def fix_last_page_zero(plist_data):
-    """Fix bookmarks where Last Page = 0 by setting it to First Page value."""
-    fixed_count = 0
-    
-    def fix_bookmark(obj):
-        nonlocal fixed_count
-        if isinstance(obj, dict):
-            # Check if this is a bookmark entry
-            if 'First Page' in obj and 'Last Page' in obj:
-                if obj.get('Last Page') == 0:
-                    first_page = obj.get('First Page', 0)
-                    obj['Last Page'] = first_page
-                    fixed_count += 1
-            # Recursively process all values
-            for value in obj.values():
-                fix_bookmark(value)
-        elif isinstance(obj, list):
-            for item in obj:
-                fix_bookmark(item)
-    
-    fix_bookmark(plist_data)
-    return plist_data, fixed_count
-
-
-def clean_bookmarks_in_plist(plist_data, merge_meta=False, no_dedup=False):
-    """Clean all bookmark lists in the plist structure.
-
-    If merge_meta=True, metadata from duplicate bookmarks is merged into
-    the first occurrence before duplicates are removed.
-    If no_dedup=True, skip deduplication entirely (keeps all bookmarks).
+    For every bookmark where Last Page == First Page (page-bookmark style),
+    copy available score-level metadata into the bookmark dict if not already
+    present.  Returns count of bookmarks touched.
     """
-    bookmark_lists = find_all_bookmarks(plist_data)
-    
-    print(f"\nFound {len(bookmark_lists)} bookmark lists to process")
-    
-    if no_dedup:
-        print("  ⚠ Deduplication SKIPPED (--no-dedup flag set)")
-        total_original = sum(len(bm_list['bookmarks']) for bm_list in bookmark_lists)
-        return plist_data, []
-    
-    total_original = 0
-    total_unique = 0
-    total_duplicates = 0
-    all_duplicates = []
-    
-    for bm_list in bookmark_lists:
-        original_count = len(bm_list['bookmarks'])
-        unique_bookmarks, duplicates = remove_duplicate_bookmarks(
-            bm_list['bookmarks'],
-            merge_meta=merge_meta
+    META_MAP = {
+        'composer':  'Composer',
+        'genre':     'Genre',
+        'keywords':  'Keyword',
+        'key':       'Key',
+        'bpm':       'BPM',
+        'signature': 'Signature',
+    }
+    count = 0
+    for key, value in plist.items():
+        if not key.endswith('|bookmarks') or not isinstance(value, list):
+            continue
+        filepath = key[:-len('|bookmarks')]
+        score_meta = {}
+        for src_key, dst_key in META_MAP.items():
+            full_key = f'{filepath}|{src_key}'
+            if full_key in plist and plist[full_key] not in (None, ''):
+                score_meta[dst_key] = plist[full_key]
+        if not score_meta:
+            continue
+        for bm in value:
+            if not isinstance(bm, dict):
+                continue
+            lp = bm.get('Last Page')
+            fp = bm.get('First Page')
+            if lp == fp:   # page-style bookmark
+                touched = False
+                for dst_key, val in score_meta.items():
+                    if bm.get(dst_key) in (None, ''):
+                        bm[dst_key] = val
+                        touched = True
+                if touched:
+                    count += 1
+    return count
+
+
+def clean_plist(plist: dict,
+                no_dedup:      bool = False,
+                merge_meta:    bool = False,
+                last_page_fix: bool = False,
+                page2item:     bool = False) -> dict:
+    """
+    Apply all requested cleaning operations to the plist in-place.
+    Returns a stats dict with counts of changes.
+    """
+    stats = {
+        'bookmark_lists':   0,
+        'total_bookmarks':  0,
+        'removed_dupes':    0,
+        'last_page_fixed':  0,
+        'page2item_copied': 0,
+    }
+
+    bookmark_lists = find_bookmark_lists(plist)
+    stats['bookmark_lists']  = len(bookmark_lists)
+    stats['total_bookmarks'] = sum(len(bl['bookmarks']) for bl in bookmark_lists)
+
+    if not no_dedup:
+        total_removed = 0
+        for bl in bookmark_lists:
+            orig    = bl['bookmarks']
+            unique, n_removed = deduplicate_bookmarks(orig, merge_meta=merge_meta)
+            bl['parent'][bl['key']] = unique
+            total_removed += n_removed
+            if n_removed > 0:
+                print(f"    {bl['key']}: {len(orig)} -> {len(unique)} (-{n_removed})")
+        stats['removed_dupes'] = total_removed
+
+    if last_page_fix or page2item:
+        stats['last_page_fixed'] = fix_last_page(plist)
+
+    if page2item:
+        stats['page2item_copied'] = copy_score_meta_to_bookmarks(plist)
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Writing the output .4sb file
+# ---------------------------------------------------------------------------
+def write_cleaned_4sb(
+    input_path:          str,
+    output_path:         str,
+    original_raw_header: bytes,
+    new_metadata_gz:     bytes,
+    metadata_end:        int,
+    file_size:           int,
+    total_records:       int,
+) -> None:
+    """
+    Write a new .4sb file:
+      1. Updated 74-byte file header (metadata_size updated)
+      2. New metadata gzip block (cleaned plist)
+      3. All original records copied verbatim (record header + compressed data)
+
+    Records are streamed in 8 MB chunks for memory efficiency on large archives.
+    """
+    COPY_CHUNK = 8 * 1024 * 1024   # 8 MB
+
+    new_header = rebuild_header(original_raw_header, len(new_metadata_gz))
+
+    t0           = time.monotonic()
+    t_last_min   = t0
+    bytes_copied = 0
+    records_done = 0
+    pos          = metadata_end
+
+    with open(input_path, 'rb') as src, open(output_path, 'wb') as dst:
+        # 1. Write updated file header
+        dst.write(new_header)
+
+        # 2. Write new metadata gzip
+        dst.write(new_metadata_gz)
+
+        # 3. Copy all records verbatim
+        while pos < file_size:
+            elapsed   = time.monotonic() - t0
+            speed     = bytes_copied / elapsed if elapsed > 0 else 0
+            remaining = (file_size - metadata_end) - bytes_copied
+            eta       = remaining / speed if speed > 0 else 0
+
+            _clear_line()
+            sys.stdout.write(
+                f'  {_bar(records_done, total_records)}'
+                f'  {_fmt_speed(speed)}  ETA {_fmt_eta(eta)}'
+            )
+            sys.stdout.flush()
+
+            # Read record header (up to 512 bytes to find gzip magic)
+            src.seek(pos)
+            buf = src.read(512)
+            if not buf:
+                break
+
+            gz_idx = buf.find(b'\x1f\x8b\x08')
+            if gz_idx == -1:
+                break   # no more records
+
+            header_text = buf[:gz_idx].decode('latin-1', errors='replace')
+            nums        = re.findall(r'\d+', header_text[:NUMERIC_PREFIX_LEN])
+            if not nums:
+                break
+            compressed_size = int(nums[-1])
+
+            gzip_start = pos + gz_idx
+            next_pos   = gzip_start + compressed_size
+
+            # Write ASCII record header bytes verbatim
+            dst.write(buf[:gz_idx])
+
+            # Stream compressed gzip data in chunks
+            bytes_remaining = compressed_size
+            src.seek(gzip_start)
+            while bytes_remaining > 0:
+                chunk_size = min(COPY_CHUNK, bytes_remaining)
+                chunk      = src.read(chunk_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                bytes_remaining -= len(chunk)
+
+            bytes_copied += gz_idx + compressed_size   # header + data
+            records_done += 1
+            pos = next_pos
+
+            # 60-second periodic status line
+            now = time.monotonic()
+            if now - t_last_min >= 60:
+                t_last_min = now
+                elapsed2   = time.monotonic() - t0
+                print()
+                print(
+                    f'  [{_now()}  {_fmt_eta(elapsed2)} elapsed]'
+                    f'  {records_done}/{total_records} records copied'
+                    f'  {_fmt_bytes(bytes_copied)} written'
+                )
+
+    elapsed = time.monotonic() - t0
+    _clear_line()
+    print(
+        f'  {_bar(records_done, total_records)}'
+        f'  done in {_fmt_eta(elapsed)}'
+        f'  ({records_done} records, {_fmt_bytes(bytes_copied)})'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+def validate_input(filepath: str) -> None:
+    p = Path(filepath)
+    if not p.exists():
+        sys.exit(f'Error: file not found: {filepath}')
+    if p.suffix.lower() != '.4sb':
+        sys.exit(f'Error: expected a .4sb file, got: {p.name}')
+    with open(filepath, 'rb') as f:
+        header = f.read(HEADER_SIZE).decode('ascii', errors='replace')
+    if '4SBV02' not in header and '4SBV03' not in header:
+        sys.exit(
+            f'Error: file does not appear to be a forScore .4sb file '
+            f'(neither 4SBV02 nor 4SBV03 found in header).'
         )
-        unique_count = len(unique_bookmarks)
-        dup_count = original_count - unique_count
-        
-        total_original += original_count
-        total_unique += unique_count
-        total_duplicates += dup_count
-        
-        if dup_count > 0:
-            print(f"  {bm_list['path']}: {original_count} -> {unique_count} (removed {dup_count} duplicates)")
-            all_duplicates.extend(duplicates)
-        
-        bm_list['parent'][bm_list['key']] = unique_bookmarks
-    
-    print(f"\n=== Summary ===")
-    print(f"Total bookmarks: {total_original}")
-    print(f"Unique bookmarks: {total_unique}")
-    print(f"Duplicates removed: {total_duplicates}")
-    
-    return plist_data, all_duplicates
 
 
-def create_4sb_file(header, gzip_header, plist_data, output_path, is_archive=False, artifacts_data=None):
-    """Create a new .4sb file from cleaned data."""
-    file_type = "archive" if is_archive else "backup"
-    print(f"\nCreating cleaned {file_type} file: {output_path}")
-    
-    # Serialize plist
-    plist_bytes = plistlib.dumps(plist_data, fmt=plistlib.FMT_BINARY)
-    
-    # Create gzip compressed data - IMPORTANT: Only compress metadata, not additional data!
-    gzip_buffer = io.BytesIO()
-    gz = gzip.GzipFile(fileobj=gzip_buffer, mode='wb', compresslevel=9)
-    gz.write(plist_bytes)
-    gz.close()  # MUST close before getvalue() to ensure all data is flushed
-    gzip_data = gzip_buffer.getvalue()
-    
-    # Update header to match new metadata size
-    metadata_size = len(gzip_data)
-    
-    try:
-        header_str = header.decode('ascii')
-        
-        # Find the metadata size number in the header
-        # Format: <--4SBV02-->              30         1367604Backup...
-        # The number before "Backup" or "Archiv" is the metadata size
-        import re
-        match = re.search(r'(\d{5,10})(Backup|Archiv)', header_str)
-        
-        if match:
-            old_size_str = match.group(1)
-            old_size = int(old_size_str)
-            new_size_str = str(metadata_size)
-            
-            # Replace with right-aligned, space-padded version to maintain exact length
-            padding_needed = len(old_size_str) - len(new_size_str)
-            if padding_needed >= 0:
-                new_size_padded = ' ' * padding_needed + new_size_str
-                header_str = header_str.replace(old_size_str, new_size_padded, 1)
-                header = header_str.encode('ascii')
-                print(f"✓ Updated header metadata size: {old_size:,} → {metadata_size:,} bytes")
-            else:
-                print(f"⚠ Warning: New metadata size ({metadata_size}) is too large for header field!")
-                print(f"  Keeping original header - file may not import correctly")
-        else:
-            print(f"⚠ Warning: Could not find metadata size in header")
-            print(f"  Keeping original header - file may not import correctly")
-            
-    except Exception as e:
-        print(f"⚠ Warning: Could not parse header: {e}")
-        print(f"  Keeping original header")
-    
-    # Combine header + gzip data
-    # Note: We do NOT append additional data (drawings, annotations) as they
-    # contain references to byte offsets in the metadata which would be invalid
-    # after any modifications (dedup, page2item, etc.)
-    output_data = header + gzip_data
-    
-    # Write output file
-    with open(output_path, 'wb') as f:
-        f.write(output_data)
-    
-    print(f"✓ Created {output_path} ({len(output_data):,} bytes)")
-
-
-def convert_to_json_serializable(obj):
-    """Convert data to JSON-serializable format."""
+# ---------------------------------------------------------------------------
+# JSON export helper
+# ---------------------------------------------------------------------------
+def _to_json_safe(obj):
     if isinstance(obj, dict):
-        return {k: convert_to_json_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_to_json_serializable(item) for item in obj]
-    elif isinstance(obj, (str, int, float, bool, type(None))):
+        return {k: _to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_json_safe(i) for i in obj]
+    if isinstance(obj, (str, int, float, bool, type(None))):
         return obj
-    elif isinstance(obj, bytes):
-        return obj.hex() if len(obj) < 1000 else f"<{len(obj)} bytes>"
-    else:
-        return str(obj)
+    if isinstance(obj, bytes):
+        return obj.hex() if len(obj) < 1000 else f'<{len(obj)} bytes>'
+    return str(obj)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description='Clean duplicate bookmarks from forScore .4sb backup and archive files'
+        description=(
+            'Clean duplicate bookmarks from a forScore .4sb file, '
+            'preserving all embedded records (PDFs, MP3s, annotation PNGs).'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
     parser.add_argument(
-        'input_file',
-        help='Input .4sb backup or archive file'
+        'input', metavar='INPUT.4sb',
+        help='Path to a forScore Backup (V02) or Archive (V03) .4sb file',
     )
     parser.add_argument(
-        '-o', '--output',
-        help='Output directory (default: creates subdirectory named after input file)'
+        '-o', '--output-dir', metavar='OUTPUT_DIR',
+        help='Output directory (default: <input-stem>/ next to input file)',
     )
     parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Analyze duplicates without creating output files'
+        '--dry-run', action='store_true',
+        help='Analyse only; do not write any output files',
     )
     parser.add_argument(
-        '-m', '--merge-meta',
-        action='store_true',
-        help='Merge metadata from duplicate bookmarks (keep first occurrence and fill missing fields from others)'
+        '-m', '--merge-meta', action='store_true',
+        help='Merge metadata from duplicate bookmarks into the kept entry',
     )
     parser.add_argument(
-        '--no-extract-artifacts',
-        action='store_true',
-        help='Skip artifact extraction for archive files (artifacts will still be embedded in cleaned file)'
+        '--no-dedup', action='store_true',
+        help='Skip bookmark deduplication (still applies --last-page-fix / --page2item if set)',
     )
     parser.add_argument(
-        '--no-dedup',
-        action='store_true',
-        help='Skip bookmark deduplication (only fix Last Page=0 and preserve additional data like drawings)'
+        '--last-page-fix', action='store_true',
+        help='Set Last Page = First Page wherever Last Page is 0',
     )
     parser.add_argument(
-        '--last-page-fix',
-        action='store_true',
-        help='Fix bookmarks where Last Page = 0 (set to First Page value)'
+        '--page2item', action='store_true',
+        help=(
+            'Like --last-page-fix but also copies score-level metadata '
+            '(Composer, Genre, Key, BPM...) into page-style bookmarks'
+        ),
     )
-    parser.add_argument(
-        '--page2item',
-        action='store_true',
-        help='Convert Page Bookmarks to Item Bookmarks (sets Last Page and copies score metadata)'
-    )
-    
     args = parser.parse_args()
-    
-    input_path = Path(args.input_file)
-    if not input_path.exists():
-        print(f"Error: File not found: {input_path}")
-        sys.exit(1)
-    
-    # Determine output directory
-    if args.output:
-        output_dir = Path(args.output)
-    else:
-        # Create subdirectory named after input file (without extension)
-        output_dir = input_path.parent / input_path.stem
-    
-    # Create output directory structure
-    if not args.dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        artifacts_dir = output_dir / 'artefacts'
-    
-    # Extract data
+
+    validate_input(args.input)
+
+    p         = Path(args.input).resolve()
+    file_size = p.stat().st_size
+    ts_start  = _now()
+
+    print(f'Started:  {ts_start}')
+    print(f'Input:    {p.name}  ({_fmt_bytes(file_size)})')
+
+    # --- Parse file header ---------------------------------------------------
     try:
-        extract_artifacts = not args.no_extract_artifacts and not args.dry_run
-        return_artifacts = True  # Always return artifacts data for archive files to re-embed them
-        
-        extracted = extract_4sb_file(
-            input_path,
-            extract_artifacts=extract_artifacts,
-            artifacts_dir=artifacts_dir if not args.dry_run else None,
-            return_artifacts_data=return_artifacts
-        )
-    except Exception as e:
-        print(f"Error extracting file: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # Save original JSON (before cleaning)
-    if not args.dry_run:
-        original_json_path = output_dir / f"{input_path.stem}-original.json"
-        json_data = convert_to_json_serializable({
-            'header': extracted['header'].hex() if isinstance(extracted['header'], bytes) else str(extracted['header']),
-            'data': extracted['data'],
-            'file_type': extracted['file_type']
-        })
-        with open(original_json_path, 'w', encoding='utf-8') as f:
-            json.dump(json_data, f, indent=2, ensure_ascii=False, default=str)
-        print(f"\n✓ Original data saved to: {original_json_path}")
-        # Also save original plist (binary) for reference
-        original_plist_path = output_dir / f"{input_path.stem}-original.plist"
-        original_plist_bytes = plistlib.dumps(extracted['data'], fmt=plistlib.FMT_BINARY)
-        with open(original_plist_path, 'wb') as f:
-            f.write(original_plist_bytes)
-        print(f"✓ Original plist saved to: {original_plist_path}")
-    
-    # Clean bookmarks
-    if args.no_dedup:
-        print("\n⚠ Skipping bookmark deduplication (--no-dedup flag set)")
-    else:
-        print("\nCleaning bookmarks...")
-    cleaned_data, duplicates = clean_bookmarks_in_plist(
-        extracted['data'],
-        merge_meta=args.merge_meta,
-        no_dedup=args.no_dedup
+        hdr = read_file_header(str(p))
+    except ValueError as e:
+        sys.exit(f'Error reading file header: {e}')
+
+    file_type = 'Archive (V03)' if hdr['is_archive'] else 'Backup (V02)'
+    print(f'Type:     {file_type}')
+    print(
+        f'Metadata: {_fmt_bytes(hdr["metadata_size"])} compressed  '
+        f'(records start at offset {hdr["metadata_end"]:,})'
     )
-    
-    # Convert Page Bookmarks to Item Bookmarks (only if --page2item is set)
-    if args.page2item:
-        print("\nConverting Page Bookmarks to Item Bookmarks...")
-        cleaned_data, converted_count = convert_page_to_item_bookmarks(cleaned_data)
-        if converted_count > 0:
-            print(f"✓ Converted {converted_count} Page Bookmarks to Item Bookmarks")
-            print(f"  (Set Last Page and copied score metadata: Genre, Composer, Keyword, etc.)")
-        else:
-            print("✓ No Page Bookmarks found to convert")
-    elif args.last_page_fix:
-        # Legacy --last-page-fix (only sets Last Page, no metadata)
-        print("\nFixing bookmarks with Last Page = 0...")
-        cleaned_data, fixed_count = fix_last_page_zero(cleaned_data)
-        if fixed_count > 0:
-            print(f"✓ Fixed {fixed_count} bookmarks where Last Page = 0 (set to First Page value)")
-            print(f"  Note: Use --page2item to also copy score metadata")
-        else:
-            print("✓ No bookmarks with Last Page = 0 found")
+    print()
+
+    # --- Determine output paths ----------------------------------------------
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
     else:
-        print("\nSkipping Page Bookmark fixes (use --page2item or --last-page-fix to enable)")
-    
-    # Save cleaned JSON
+        out_dir = p.parent / p.stem
+
+    out_4sb  = out_dir / f'{p.stem}-cleaned.4sb'
+    out_json = out_dir / f'{p.stem}-cleaned.json'
+
     if not args.dry_run:
-        cleaned_json_path = output_dir / f"{input_path.stem}-cleaned.json"
-        cleaned_json_data = convert_to_json_serializable({
-            'header': extracted['header'].hex() if isinstance(extracted['header'], bytes) else str(extracted['header']),
-            'data': cleaned_data,
-            'file_type': extracted['file_type']
-        })
-        with open(cleaned_json_path, 'w', encoding='utf-8') as f:
-            json.dump(cleaned_json_data, f, indent=2, ensure_ascii=False, default=str)
-        print(f"✓ Cleaned data saved to: {cleaned_json_path}")
-        # Also save cleaned plist (binary)
-        cleaned_plist_path = output_dir / f"{input_path.stem}-cleaned.plist"
-        cleaned_plist_bytes = plistlib.dumps(cleaned_data, fmt=plistlib.FMT_BINARY)
-        with open(cleaned_plist_path, 'wb') as f:
-            f.write(cleaned_plist_bytes)
-        print(f"✓ Cleaned plist saved to: {cleaned_plist_path}")
-    
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f'Output:   {out_4sb}')
+        print()
+
+    # --- Read and parse plist ------------------------------------------------
+    print('Reading metadata...')
+    try:
+        plist = read_plist(str(p), hdr['metadata_end'])
+    except Exception as e:
+        sys.exit(f'Error reading metadata plist: {e}')
+    print(f'  Parsed plist: {len(plist):,} top-level keys')
+    print()
+
+    # --- Count records (Phase 1) ---------------------------------------------
+    payload_size = file_size - hdr['metadata_end']
+    print(f'Phase 1 -- Counting records  (payload {_fmt_bytes(payload_size)})...')
+    total_records = count_records(str(p), hdr['metadata_end'], file_size)
+    print()
+
+    # --- Clean plist ---------------------------------------------------------
+    print('Cleaning plist...')
+    if args.no_dedup:
+        print('  Deduplication: SKIPPED (--no-dedup)')
+    stats = clean_plist(
+        plist,
+        no_dedup=args.no_dedup,
+        merge_meta=args.merge_meta,
+        last_page_fix=args.last_page_fix,
+        page2item=args.page2item,
+    )
+
+    print()
+    print('Cleaning summary:')
+    print(f'  Bookmark lists processed:  {stats["bookmark_lists"]:>6,}')
+    print(f'  Total bookmarks (before):  {stats["total_bookmarks"]:>6,}')
+    if not args.no_dedup:
+        after = stats['total_bookmarks'] - stats['removed_dupes']
+        pct   = (
+            100.0 * stats['removed_dupes'] / stats['total_bookmarks']
+            if stats['total_bookmarks'] else 0.0
+        )
+        print(f'  Duplicates removed:        {stats["removed_dupes"]:>6,}  ({pct:.1f}%)')
+        print(f'  Bookmarks after:           {after:>6,}')
+    if stats['last_page_fixed']:
+        print(f'  Last Page = 0 fixed:       {stats["last_page_fixed"]:>6,}')
+    if stats['page2item_copied']:
+        print(f'  Page->Item meta copied:    {stats["page2item_copied"]:>6,}')
+    print()
+
     if args.dry_run:
-        print("\n=== Dry run complete ===")
-        print("Use without --dry-run to create cleaned files")
-    else:
-        # Create cleaned .4sb file
-        is_archive = extracted['file_type']['is_archive']
-        output_file = output_dir / f"{input_path.stem}-cleaned.4sb"
-        
-        # Check if there is additional data after metadata (annotations, drawings, etc.)
-        # This can exist in both Backup (V02) and Archive (V03) files!
-        artifacts_data = None
-        file_size = os.path.getsize(extracted['filepath'])
-        has_additional_data = file_size > extracted['metadata_end']
-        
-        if has_additional_data:
-            additional_size = file_size - extracted['metadata_end']
-            print(f"\n⚠️  File contains {additional_size:,} bytes of additional data (drawings, annotations)")
-            print(f"   These will NOT be preserved - drawings require unchanged metadata structure")
-            print(f"   Any modifications (dedup, page2item, etc.) will break drawing references")
-        
-        try:
-            create_4sb_file(
-                extracted['header'],
-                extracted['gzip_header'],
-                cleaned_data,
-                output_file,
-                is_archive=is_archive,
-                artifacts_data=artifacts_data
-            )
-            print(f"\n✓ Cleaned {extracted['file_type']['version']} file created successfully!")
-            print(f"  Output directory: {output_dir}")
-            if has_additional_data:
-                print(f"  ⚠️  Note: Drawings/annotations were NOT preserved")
-                print(f"     They require unchanged metadata structure")
-            print(f"  You can now restore this backup in forScore")
-        except Exception as e:
-            print(f"\nError creating output file: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
+        print('Dry run -- no output written.')
+        return
+
+    # --- Compress new plist --------------------------------------------------
+    print('Compressing cleaned metadata...')
+    new_metadata_gz = compress_plist(plist)
+    old_sz = hdr['metadata_size']
+    new_sz = len(new_metadata_gz)
+    delta  = new_sz - old_sz
+    sign   = '+' if delta >= 0 else ''
+    print(f'  {_fmt_bytes(old_sz)}  ->  {_fmt_bytes(new_sz)}  ({sign}{_fmt_bytes(abs(delta))} {"more" if delta >= 0 else "less"})')
+    print()
+
+    # --- Save cleaned JSON (for debugging) -----------------------------------
+    print('Writing debug JSON...')
+    with open(out_json, 'w', encoding='utf-8') as f:
+        json.dump(_to_json_safe(plist), f, indent=2, ensure_ascii=False)
+    print(f'  {out_json}')
+    print()
+
+    # --- Write output .4sb (Phase 2) -----------------------------------------
+    print(f'Phase 2 -- Writing cleaned .4sb  ({total_records} records to copy)...')
+    write_cleaned_4sb(
+        input_path=str(p),
+        output_path=str(out_4sb),
+        original_raw_header=hdr['raw'],
+        new_metadata_gz=new_metadata_gz,
+        metadata_end=hdr['metadata_end'],
+        file_size=file_size,
+        total_records=total_records,
+    )
+    print()
+
+    # --- Final summary -------------------------------------------------------
+    out_size  = out_4sb.stat().st_size
+    ts_end    = _now()
+    size_diff = out_size - file_size
+    sign      = '+' if size_diff >= 0 else ''
+
+    print('=' * 56)
+    print('DONE')
+    print('=' * 56)
+    print(f'  Started:          {ts_start}')
+    print(f'  Finished:         {ts_end}')
+    print()
+    print(f'  Input:            {_fmt_bytes(file_size)}')
+    print(f'  Output:           {_fmt_bytes(out_size)}')
+    print(f'  Size difference:  {sign}{_fmt_bytes(abs(size_diff))} (metadata cleaned)')
+    print()
+    print(f'  Records copied:   {total_records:,}')
+    print(f'  Dupes removed:    {stats["removed_dupes"]:,}')
+    print()
+    print(f'  Output file:      {out_4sb}')
+    print(f'  Debug JSON:       {out_json}')
+    print('=' * 56)
 
 
 if __name__ == '__main__':
