@@ -226,5 +226,22 @@ After cleaning an Archive:
 
 ## Requirements
 
-- Python 3.7+
-- No external dependencies (stdlib only: `plistlib`, `gzip`, `zlib`, `json`, `sqlite3`)
+- **Mac** (macOS) — the scripts have only been tested on macOS
+- **Python 3.7+** — no external dependencies (stdlib only: `plistlib`, `gzip`, `zlib`, `json`, `sqlite3`)
+
+### Installing Python 3 on a Mac
+
+macOS does not ship with Python 3 by default. The recommended way to install it is via [Homebrew](https://brew.sh):
+
+```bash
+# 1. Install Homebrew (if not already installed)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. Install Python 3
+brew install python
+
+# 3. Verify
+python3 --version
+```
+
+Alternatively, download the official installer from [python.org/downloads](https://www.python.org/downloads/).
