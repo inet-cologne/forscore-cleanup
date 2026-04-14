@@ -1,71 +1,140 @@
 # forScore Backup Cleanup Tools
 
-Tools for cleaning bloated forScore backup/archive files (`.4sb`) and migrating forScore data to MobileSheets.
+This is all about dealing with the forScore sheet reader app issues relating to iCloud sync problems (producing thousands of bookmark duplicates under the hood) and options to clean up your forScore library and to extract, backup and/or transfer data to another sheet reader app like MobileSheets.
+
+**The bad news:**
+Until today: no fixes, no helpful support and no interest in the issues from the developer himself!
+
+**The good news:**
+I did reverse engineering research and developed a few helpful tools.
+I have 3 ready scripts and a 4th in testing to help on getting rid of the duplicates and reusing data in forScore, and to extract/prepare and transform your data for raw backup purposes and for use in other apps like MobileSheets.
+They all work with an exported `Archiv*.4sb` file (or `Backup*.4sb` for metadata-only operations).
 
 ---
 
-> **WARNING — Early Version / Use at Your Own Risk**
+> **WARNING — USE AT YOUR OWN RISK!**
+>
+> Please consider making backups of everything and be sure about what you are doing BEFORE using any of the information or scripts mentioned here, as I am not responsible for any damage or data loss that might occur. I mainly do not have the time to help you get out of problems if they occur.
 >
 > This is an early version. Not all features have been tested. Documentation and code may contain errors or be misleading.
->
-> **Before using any of these tools:**
-> - Create a full backup: export an `Archive.4sb` from forScore and store it in a safe place outside the app (e.g. Files app, local Mac folder)
-> - These tools come **without any warranty** and **without support**
-> - Use entirely **at your own risk**
 
 ---
 
-## What These Tools Do
+## The Details
 
-**`clean_forscore_bookmarks.py`** — removes duplicate bookmarks from a forScore `.4sb` file (Backup or Archive) and produces a cleaned copy ready to restore. Unlike v1, **draw annotations (handwritten ink strokes stored as PNG) are fully preserved** in the output file.
+### 1. `analyze_forscore_backup.py`
 
-**`forScore2MS.py`** — imports forScore data (songs, bookmarks, setlists, audio links) directly from a `.4sb` file into a MobileSheets SQLite database. No JSON intermediate step required.
+Shows basic stats of your data, especially the duplicate status.
 
-**`extract_binaries_forscore_backup.py`** — extracts all embedded files (PDFs, audio, PNG drawings, etc.) from a forScore Archive (`.4sb` V03) into a local directory.
+```bash
+python3 analyze_forscore_backup.py "Backup 2026-01-03.4sb"
+```
 
-## Background
+My stats before cleaning:
 
-The forScore iPad app (sheet music reader) maintains all metadata — bookmarks, setlists, annotations — within the app. When iCloud Sync is active, sync interruptions cause bookmarks to accumulate massive numbers of duplicates (up to 93% of all bookmarks can be duplicates in affected libraries). There are no built-in tools to remove them.
+```
+===========================================
+SUMMARY
+===========================================
+  Songs (PDFs):             1,280
+  Setlists:                   110
+  Bookmarks (total):       24,241
+  Bookmarks (unique):       1,745
+  Bookmarks (duplicate):   22,496  (92.8%)
+===========================================
+```
 
-Creating backups within forScore puts all data in a single `.4sb` file:
+As you can see, the main problem in my library are the 22,500 duplicates!
 
-| Type | Filename prefix | Version | Contents |
-|------|----------------|---------|----------|
-| Backup | `Backup*.4sb` | `4SBV02` | Metadata only (bookmarks, setlists, annotations) |
-| Archive | `Archiv*.4sb` | `4SBV03` | Metadata + all PDFs, audio files, PNG draw annotations |
+---
 
-Both use the same internal structure: a fixed 74-byte ASCII header, followed by a gzip-compressed Apple Binary Property List (bplist) containing all metadata, followed by a sequence of gzip-compressed file records (V03 only).
+### 2. `extract_binaries_forscore_backup.py`
 
-### What is a Bookmark?
+As the name says: extracts all PDF, audio and other files — including the separate drawing annotation PNG files — from the `Archiv*.4sb` file and puts them in a separate folder. These can be used to transfer everything to another app like MobileSheets.
 
-In forScore, a **bookmark** is the primary navigation unit: it defines a piece of music as a page range within a PDF file. A single large PDF (e.g. a Real Book) can contain hundreds of bookmarks, each representing one song.
+```bash
+python3 extract_binaries_forscore_backup.py "Archiv 2026-04-12 16-00-52.4sb"
+```
 
-Duplicates arise when the same bookmark (same PDF + title + first page) gets multiple entries with different `Identifier` UUIDs due to iCloud sync conflicts.
+My summary output:
 
-### Draw Annotations
+```
+====================================================
+SUMMARY
+====================================================
+  Started:           18:53:58
+  Finished:          18:55:45
+  Duration:          1m 46s
 
-Draw annotations (handwritten ink) are stored as PNG files embedded in the `.4sb` Archive, one per annotated page. The filename encodes the PDF name and page number (`<pdfname>|<page>.png`). Because deduplication only modifies bookmark *entries* in the metadata plist — never the PDF filenames — the PNG-to-page associations remain valid after cleaning.
+  Blocks scanned:      5786
+  Files extracted:     5786
+  Skipped (corrupt):      0
 
-**`clean_forscore_bookmarks.py` copies all embedded records byte-for-byte** into the output file, so draw annotations are preserved.
+  By file type:
+    .mp3            3582
+    .pdf            1281
+    .png             898
+    .m4a              14
+    .csv               7
+    .wav               2
+    .mid               2
+====================================================
+  Output: /Users/me/developer/forscore/Archiv 2026-04-12 16-00-52/files
+====================================================
+```
 
-## Tools
+Interesting: about 900 drawing annotation files!
 
-### `clean_forscore_bookmarks.py`
+**Options:**
 
-Removes duplicate bookmarks from a `.4sb` Backup or Archive file. All embedded records (PDFs, audio, PNG draw annotations) are copied unchanged into the output.
+| Option | Description |
+|--------|-------------|
+| `-o, --output-dir` | Base output directory (default: `<stem>/` next to input) |
+| `-v, --verbose` | Print each extracted filename |
+
+---
+
+### 3. `clean_forscore_bookmarks.py`
+
+Drum roll: it cleans up the `Archiv*.4sb` file by removing all bookmark duplicates and produces a new `*-cleaned.4sb` file.
+It preserves all data including linked audio and the drawing annotations (as far as I can see at the moment).
+
+A first test run on my 30 GB Archive file shows the following result:
+
+```
+========================================================
+DONE
+========================================================
+  Started:          12:37:02
+  Finished:         12:37:15
+
+  Input:            28.1 GB
+  Output:           28.1 GB
+  Size difference:  1.9 MB (metadata cleaned)
+
+  Records copied:   5,786
+  Dupes removed:    22,496
+
+  Output file:      /Users/me/developer/forscore/Archiv 2026-04-12 16-00-52/Archiv 2026-04-12 16-00-52-cleaned.4sb
+  Debug JSON:       /Users/me/developer/forscore/Archiv 2026-04-12 16-00-52/Archiv 2026-04-12 16-00-52-cleaned.json
+========================================================
+```
+
+The most important result: I transferred the cleaned file to a different device, did a fresh forScore app download, imported the cleaned `Archiv*-cleaned.4sb` file, restored it in the app — and it seems everything is where it should be, with no duplicates in the song list!
+
+Just a quick look so far, as everything was finished today!
+
+Some drawing annotations seem to be not exactly positioned — possibly because I had some crop/zoom issues within some of the scores. But in general it looks great, as all information seems to be preserved!
 
 ```bash
 # Analyze only — no files written
-python3 clean_forscore_bookmarks.py "Backup 2026-01-03.4sb" --dry-run
+python3 clean_forscore_bookmarks.py "Archiv 2026-04-12 16-00-52.4sb" --dry-run
 
-# Create cleaned file (recommended starting point)
-python3 clean_forscore_bookmarks.py "Backup 2026-01-03.4sb"
+# Create cleaned file
+python3 clean_forscore_bookmarks.py "Archiv 2026-04-12 16-00-52.4sb"
 
 # Also merge metadata from duplicates into the kept entry
-python3 clean_forscore_bookmarks.py "Backup 2026-01-03.4sb" --merge-meta
-
-# Works equally on Archive files (V03, preserves PDFs + audio + draw annotations)
-python3 clean_forscore_bookmarks.py "Archiv 2026-04-12 16-00-52.4sb"
+python3 clean_forscore_bookmarks.py "Archiv 2026-04-12 16-00-52.4sb" --merge-meta
 ```
 
 **Options:**
@@ -79,39 +148,20 @@ python3 clean_forscore_bookmarks.py "Archiv 2026-04-12 16-00-52.4sb"
 | `--last-page-fix` | Fix bookmarks where Last Page = 0 |
 | `--page2item` | Convert Page Bookmarks to Item Bookmarks |
 
-**Output** (in `<input-stem>/`):
+---
 
-| File | Description |
-|------|-------------|
-| `<name>-cleaned.4sb` | Ready-to-restore backup/archive |
-| `<name>-original.json` | Extracted plist as JSON (for inspection) |
-| `<name>-original.plist` | Extracted binary plist |
-| `<name>-cleaned.json` | Cleaned plist as JSON |
-| `<name>-cleaned.plist` | Cleaned binary plist |
+### 4. `forScore2MS.py` *(in testing)*
 
-**What is preserved after cleaning:**
-- All bookmarks (deduplicated)
-- All setlists and their contents
-- Text annotations, buttons, links
-- Score metadata (title, composer, genre, key, BPM, …)
-- Draw annotations / ink strokes (PNG, V03 Archive only)
+This script creates a MobileSheets database file from an `Archiv*.4sb` file.
+If you copy this file and the extracted files from script #2 to a fresh MobileSheets installation and switch in the app settings to the new library (the new database file), all songs and setlists with their metadata are available in MobileSheets — including audio links.
 
-**What is modified:**
-- Duplicate bookmark entries are removed (first occurrence kept; use `--merge-meta` to consolidate metadata)
-
-### `forScore2MS.py`
-
-Imports forScore data directly from a `.4sb` file into a fresh MobileSheets SQLite database.
+Annotations are not yet included and will be added in an upcoming version.
 
 ```bash
-# Import to MobileSheets database
 python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb"
 
 # Dry run — parse and report, write no database
 python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb" --dry-run
-
-# Custom output directory
-python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb" -o /tmp/ms-import
 ```
 
 **Options:**
@@ -122,38 +172,40 @@ python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb" -o /tmp/ms-import
 | `--dry-run` | Parse and report without writing any database |
 | `-v, --verbose` | Print each inserted song title |
 
-**What is imported (Stage 1):**
-- Songs — every PDF in the library with full metadata
-- Bookmarks — each bookmark becomes a virtual song (page-range slice of a PDF)
+**What is imported:**
+- Songs — every PDF with full metadata
+- Bookmarks — each becomes a virtual song (page-range slice of a PDF)
 - Setlists — all setlists with song membership and display order
 - Audio links — linked MP3/M4A tracks
 
-**Output:** `<input-stem>-2MS/MobileSheets.db` — a fresh MobileSheets database importable by the app.
+**Output:** `<input-stem>-2MS/MobileSheets.db` — importable by the MobileSheets app.
 
-### `extract_binaries_forscore_backup.py`
+---
 
-Extracts all embedded files (PDFs, audio, PNG drawings, etc.) from a forScore Archive (V03) into a local directory.
+## Background
 
-```bash
-python3 extract_binaries_forscore_backup.py "Archiv 2026-04-12 16-00-52.4sb"
+The forScore iPad app (sheet music reader) maintains all metadata — bookmarks, setlists, annotations — within the app. When iCloud Sync is active, sync interruptions cause bookmarks to accumulate massive numbers of duplicates (up to 93% of all bookmarks can be duplicates in affected libraries). There are no built-in tools to remove them.
 
-# Custom output directory
-python3 extract_binaries_forscore_backup.py "Archiv 2026-04-12 16-00-52.4sb" -o /tmp/out
+Creating backups within forScore puts all data in a single `.4sb` file:
 
-# Verbose: print each filename as it is extracted
-python3 extract_binaries_forscore_backup.py "Archiv 2026-04-12 16-00-52.4sb" -v
-```
+| Type | Filename prefix | Version | Contents |
+|------|----------------|---------|----------|
+| Backup | `Backup*.4sb` | `4SBV02` | Metadata only (bookmarks, setlists, text annotations) |
+| Archive | `Archiv*.4sb` | `4SBV03` | Metadata + all PDFs, audio files, PNG draw annotations |
 
-**Options:**
+Both use the same internal structure: a fixed 74-byte ASCII header, followed by a gzip-compressed Apple Binary Property List (bplist) containing all metadata, followed by a sequence of gzip-compressed file records (V03 only).
 
-| Option | Description |
-|--------|-------------|
-| `-o, --output-dir` | Base output directory (default: `<stem>/` next to input) |
-| `-v, --verbose` | Print each extracted filename |
+### What is a Bookmark?
 
-Output is written to `<input-stem>/files/`. Only accepts Archive files (V03 / `Archiv*.4sb`).
+In forScore, a **bookmark** is the primary navigation unit: it defines a piece of music as a page range within a PDF file. A single large PDF (e.g. a Real Book) can contain hundreds of bookmarks, each representing one song.
 
-### Shell helpers
+Duplicates arise when the same bookmark (same PDF + title + first page) gets multiple entries with different `Identifier` UUIDs due to iCloud sync conflicts.
+
+### Draw Annotations
+
+Handwritten ink strokes are stored as PNG files embedded in the `Archiv*.4sb` file, one per annotated page. The filename encodes the PDF name and page number (`<pdfname>|<page>.png`). Because deduplication only modifies bookmark *entries* in the metadata — never the PDF filenames — the PNG-to-page associations remain valid after cleaning. `clean_forscore_bookmarks.py` copies all embedded records byte-for-byte into the output file, so draw annotations are fully preserved.
+
+## Shell Helpers
 
 | Script | Purpose |
 |--------|---------|
@@ -164,10 +216,10 @@ Output is written to `<input-stem>/files/`. Only accepts Archive files (V03 / `A
 
 ## Restore Workflow
 
-After cleaning a Backup or Archive:
+After cleaning an Archive:
 
 1. On iPad: open forScore → **Settings → Backup & Restore**
-2. Import the cleaned `.4sb` file via Files / AirDrop
+2. Import the cleaned `*-cleaned.4sb` file via Files / AirDrop
 3. Restore from that backup
 
 ## Requirements
