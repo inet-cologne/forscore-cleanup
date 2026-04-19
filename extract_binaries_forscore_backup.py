@@ -332,11 +332,10 @@ def extract_records(
                 compressed = f.read(compressed_size)
                 content    = gzip.decompress(compressed)
             except Exception:
-                skipped += 1
-                pos = rec['next_pos']
-                bytes_read += compressed_size
-                i += 1
-                continue
+                # Fallback: payload is not gzip-compressed, treat as raw data.
+                # Some Archive.4sb variants store file payloads uncompressed
+                # despite having gzip magic bytes in the record header area.
+                content = compressed
 
             if not content:
                 skipped += 1
