@@ -128,6 +128,14 @@ Just a quick look so far, as everything was finished today!
 
 Some drawing annotations seem to be not exactly positioned — possibly because I had some crop/zoom issues within some of the scores. But in general it looks great, as all information seems to be preserved!
 
+==> The few annotations failures (zoom factor) can be healed too by
+importing a Backup.4sb file (not Archive.4sb) *after* you‘ve
+- deleted forScore app
+- reloaded forScore App from Apple Store
+- imported the cleaned Archived.4sb file
+
+==> Fortunately importing the Backup.4sb (does not contain the binaries) after a cleanup restore just updates meta data and annotations of existing songs but ignores previously removed duplicates!
+
 ```bash
 # Analyze only — no files written
 python3 clean_forscore_bookmarks.py "Archiv 2026-04-12 16-00-52.4sb" --dry-run
