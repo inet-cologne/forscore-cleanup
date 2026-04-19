@@ -93,6 +93,9 @@ Interesting: about 900 drawing annotation files!
 |--------|-------------|
 | `-o, --output-dir` | Base output directory (default: `<stem>/` next to input) |
 | `-v, --verbose` | Print each extracted filename |
+| `--midi-doc` | Decode MIDI presets from archive metadata and write `midi-presets.md` |
+
+`--midi-doc` reads the MIDI preset configuration stored in the archive metadata and writes a `midi-presets.md` file parallel to the `files/` directory (e.g. `<stem>/midi-presets.md`). It decodes both Program Change and raw hex CC commands into readable form and shows a preset/command count in the terminal summary.
 
 ---
 

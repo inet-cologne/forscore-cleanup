@@ -12,18 +12,22 @@ header, so it never scans the entire file byte-by-byte.
 
 Usage:
     extract_binaries_forscore_backup.py <input.4sb> [-o OUTPUT_DIR] [-v]
+                                        [--midi-doc]
 
 Output directory layout (default):
     <input-stem>/files/   (sibling to the input file)
 
 With -o:
     <OUTPUT_DIR>/files/
+
+Existing files in the output directory are overwritten.
 """
 
 import sys
 import os
 import re
 import gzip
+import plistlib
 import argparse
 import time
 from collections import defaultdict
@@ -102,6 +106,219 @@ def read_metadata_end(filepath: str) -> int:
 
     metadata_size = int(match.group(1))
     return FORSCORE_HEADER_SIZE + metadata_size
+
+
+# ---------------------------------------------------------------------------
+# MIDI preset extraction
+# ---------------------------------------------------------------------------
+
+def _read_plist_from_4sb(filepath: str) -> dict:
+    """Read and return the metadata plist from a .4sb file."""
+    with open(filepath, 'rb') as f:
+        header = f.read(FORSCORE_HEADER_SIZE).decode('ascii', errors='replace')
+    m = re.search(r'(\d{5,12})(Backup|Archiv)', header)
+    if not m:
+        raise ValueError('Cannot parse metadata size from file header.')
+    metadata_size = int(m.group(1))
+    with open(filepath, 'rb') as f:
+        f.seek(FORSCORE_HEADER_SIZE)
+        raw = gzip.decompress(f.read(metadata_size))
+    if raw[:8] != b'bplist00':
+        raise ValueError('Metadata block is not a binary plist.')
+    return plistlib.loads(raw)
+
+
+def _resolve_nska(data: bytes) -> list:
+    """
+    Decode an NSKeyedArchiver bplist containing an NSArray of NSDictionary
+    MIDI command objects.  Returns a list of plain Python dicts.
+    """
+    inner = plistlib.loads(data)
+    objects = inner['$objects']
+
+    def resolve(obj):
+        if hasattr(obj, 'data'):           # plistlib.UID
+            return resolve(objects[obj.data])
+        if isinstance(obj, dict):
+            cls_uid = obj.get('$class')
+            classname = ''
+            if cls_uid is not None:
+                cls_obj = objects[cls_uid.data]
+                classname = cls_obj.get('$classname', '')
+            if classname == 'NSArray':
+                return [resolve(x) for x in obj.get('NS.objects', [])]
+            if classname == 'NSDictionary':
+                keys   = [resolve(k) for k in obj.get('NS.keys', [])]
+                values = [resolve(v) for v in obj.get('NS.objects', [])]
+                return dict(zip(keys, values))
+            return {k: resolve(v) for k, v in obj.items() if k != '$class'}
+        if isinstance(obj, list):
+            return [resolve(x) for x in obj]
+        return obj
+
+    top_uid = inner['$top']['root']
+    result = resolve(top_uid)
+    if isinstance(result, list):
+        return result
+    return [result] if result else []
+
+
+def _decode_hex_command(hex_str: str) -> str:
+    """
+    Decode a raw MIDI hex command string (e.g. 'B0077F') into a human-readable
+    description.
+
+    Supported status bytes:
+      0x80–0x8F  Note Off
+      0x90–0x9F  Note On
+      0xA0–0xAF  Polyphonic Key Pressure
+      0xB0–0xBF  Control Change (CC)
+      0xC0–0xCF  Program Change
+      0xD0–0xDF  Channel Pressure
+      0xE0–0xEF  Pitch Bend
+    """
+    # Pad to even length
+    s = hex_str.strip()
+    if len(s) % 2:
+        s = '0' + s
+    try:
+        raw = bytes.fromhex(s)
+    except ValueError:
+        return f'raw hex: {hex_str}'
+
+    if not raw:
+        return f'raw hex: {hex_str}'
+
+    status = raw[0]
+    kind   = status & 0xF0
+    ch     = (status & 0x0F) + 1   # 1-based channel
+
+    b1 = raw[1] if len(raw) > 1 else 0
+    b2 = raw[2] if len(raw) > 2 else 0
+
+    # Well-known CC numbers
+    CC_NAMES = {
+        0: 'Bank Select MSB', 1: 'Modulation', 2: 'Breath Controller',
+        4: 'Foot Pedal', 5: 'Portamento Time', 6: 'Data Entry MSB',
+        7: 'Volume', 8: 'Balance', 10: 'Pan', 11: 'Expression',
+        12: 'Effect Control 1', 13: 'Effect Control 2',
+        16: 'General Purpose 1', 17: 'General Purpose 2',
+        18: 'General Purpose 3', 19: 'General Purpose 4',
+        20: 'Unregistered 20', 21: 'Unregistered 21', 22: 'Unregistered 22',
+        26: 'Unregistered 26', 27: 'Unregistered 27',
+        32: 'Bank Select LSB', 64: 'Sustain Pedal', 65: 'Portamento On/Off',
+        66: 'Sostenuto', 67: 'Soft Pedal', 68: 'Legato', 69: 'Hold 2',
+        91: 'Reverb', 92: 'Tremolo', 93: 'Chorus', 94: 'Detune', 95: 'Phaser',
+        120: 'All Sound Off', 121: 'Reset All Controllers',
+        122: 'Local Control', 123: 'All Notes Off',
+    }
+
+    if kind == 0xB0:
+        cc_name = CC_NAMES.get(b1, f'CC#{b1}')
+        return f'CC on Ch.{ch}  {cc_name} (#{b1}) = {b2}  [{hex_str}]'
+    if kind == 0xC0:
+        return f'Program Change on Ch.{ch}  PC={b1}  [{hex_str}]'
+    if kind == 0x90:
+        return f'Note On  Ch.{ch}  note={b1}  vel={b2}  [{hex_str}]'
+    if kind == 0x80:
+        return f'Note Off  Ch.{ch}  note={b1}  vel={b2}  [{hex_str}]'
+    if kind == 0xE0:
+        bend = (b2 << 7 | b1) - 8192
+        return f'Pitch Bend  Ch.{ch}  value={bend}  [{hex_str}]'
+    if kind == 0xD0:
+        return f'Channel Pressure  Ch.{ch}  value={b1}  [{hex_str}]'
+    if kind == 0xA0:
+        return f'Poly Key Pressure  Ch.{ch}  note={b1}  value={b2}  [{hex_str}]'
+
+    return f'raw hex: {hex_str}'
+
+
+def _format_command(cmd: dict, index: int) -> str:
+    """Format a single decoded MIDI command dict as a Markdown bullet block."""
+    kind = cmd.get('kind', '')
+    lines = [f'**Command {index}:** ', '']
+
+    if kind == 'programChange':
+        ch    = cmd.get('channel', '?')
+        pc    = cmd.get('value', '?')
+        msb   = cmd.get('msb', '?')
+        lsb   = cmd.get('lsb', '?')
+        lines[0] += 'Program Change'
+        lines[1]  = (
+            f'  - Channel: {ch}\n'
+            f'  - Program (value): {pc}\n'
+            f'  - Bank MSB: {msb}\n'
+            f'  - Bank LSB: {lsb}'
+        )
+    elif kind == 'hex':
+        hex_val = cmd.get('value', '')
+        lines[0] += f'CC / raw hex  →  {_decode_hex_command(hex_val)}'
+        lines[1]  = ''
+    else:
+        lines[0] += f'Unknown kind: `{kind}`'
+        lines[1]  = f'  - raw: `{cmd}`'
+
+    return lines[0] + ('\n' + lines[1] if lines[1] else '')
+
+
+def extract_midi_doc(filepath: str, base_dir: Path) -> tuple[Path, int, int]:
+    """
+    Read &SYS;presets from the archive plist, decode each preset's MIDI
+    commands and write a midi-presets.md file to base_dir (parallel to files/).
+
+    Returns (path, preset_count, total_command_count).
+    """
+    plist = _read_plist_from_4sb(filepath)
+    presets = plist.get('&SYS;presets', [])
+
+    total_commands = 0
+
+    lines = [
+        '# forScore MIDI Presets',
+        '',
+        f'{len(presets)} presets found.',
+        '',
+        '---',
+        '',
+    ]
+
+    for preset in presets:
+        title = preset.get('title', '(untitled)')
+        cmds_raw = preset.get('commands', b'')
+
+        lines.append(f'## {title}')
+        lines.append('')
+
+        if not cmds_raw:
+            lines.append('_(no commands)_')
+            lines.append('')
+            lines.append('---')
+            lines.append('')
+            continue
+
+        try:
+            cmds = _resolve_nska(cmds_raw)
+        except Exception as e:
+            lines.append(f'_(could not decode commands: {e})_')
+            lines.append('')
+            lines.append('---')
+            lines.append('')
+            continue
+
+        if not cmds:
+            lines.append('_(no commands)_')
+        else:
+            for i, cmd in enumerate(cmds, 1):
+                lines.append(_format_command(cmd, i))
+                lines.append('')
+            total_commands += len(cmds)
+
+        lines.append('---')
+        lines.append('')
+
+    out_path = base_dir / 'midi-presets.md'
+    out_path.write_text('\n'.join(lines), encoding='utf-8')
+    return out_path, len(presets), total_commands
 
 
 # Record header format (ASCII, fixed structure, ends right before \x1f\x8b\x08):
@@ -282,7 +499,6 @@ def extract_records(
     extracted  = 0
     skipped    = 0
     fallback_n = 0
-    used_names: set[str] = set()
     ext_counts: dict[str, int] = defaultdict(int)
     bytes_read = 0
 
@@ -355,18 +571,8 @@ def extract_records(
                 ext      = detect_extension(content)
                 out_name = f'artifact_{fallback_n:05d}{ext}'
 
-            # collision avoidance
-            final_name = out_name
-            base_stem  = Path(out_name).stem
-            base_ext   = Path(out_name).suffix
-            collision  = 1
-            while final_name in used_names:
-                collision  += 1
-                final_name = f'{base_stem}_{collision}{base_ext}'
-            used_names.add(final_name)
-
             # -- write ---------------------------------------------------------
-            out_path = out_dir / final_name
+            out_path = out_dir / out_name
             out_path.write_bytes(content)
             extracted  += 1
             ext_counts[ext] += 1
@@ -374,7 +580,7 @@ def extract_records(
 
             if verbose:
                 _clear_line()
-                print(f'  {final_name}  ({_fmt_bytes(len(content))})')
+                print(f'  {out_name}  ({_fmt_bytes(len(content))})')
 
             pos = rec['next_pos']
             i  += 1
@@ -434,6 +640,10 @@ def main():
         '-v', '--verbose', action='store_true',
         help='Print each extracted filename and size',
     )
+    parser.add_argument(
+        '--midi-doc', action='store_true',
+        help='Decode MIDI presets from the archive metadata and write midi-presets.md to the output directory',
+    )
     args = parser.parse_args()
 
     validate_input(args.input)
@@ -478,6 +688,21 @@ def main():
     )
     print()
 
+    # Phase 3 – MIDI doc (optional)
+    midi_path = None
+    midi_presets = 0
+    midi_commands = 0
+    if args.midi_doc:
+        print('Phase 3 — Generating MIDI presets doc...')
+        try:
+            midi_path, midi_presets, midi_commands = extract_midi_doc(str(p), base_dir)
+            print(f'  Presets:  {midi_presets}')
+            print(f'  Commands: {midi_commands}')
+            print(f'  Written:  {midi_path}')
+        except Exception as e:
+            print(f'  Warning: MIDI doc generation failed: {e}')
+        print()
+
     ts_end   = _now()
     elapsed  = time.monotonic() - t_wall_start
 
@@ -500,6 +725,9 @@ def main():
             print(f'    {label:<12}  {count:>6}')
     print('=' * 52)
     print(f'  Output: {out_dir}')
+    if midi_path:
+        print(f'  MIDI doc: {midi_path}')
+        print(f'    {midi_presets} presets, {midi_commands} commands')
     print('=' * 52)
 
 
