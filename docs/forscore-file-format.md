@@ -412,3 +412,51 @@ cleaned plist has different byte offsets from the original).
   preserving drawings through a cleanup.
 - The `kRecoverableDestination` flag (always `1`) appears in bookmarks, text
   annotations, and track entries — its semantics are unknown.
+
+---
+
+## 8. Known MobileSheets Migration Issues
+
+### Smart Button layout
+
+MobileSheets stores Smart Button positions as absolute screen-point coordinates
+(`XPos`, `YPos`) in its SQLite database.  There is no "fit to screen" option —
+positions are fixed at import time.
+
+`forScore2MS.py` computes the layout automatically from the button labels:
+
+1. **Button width** is estimated with an empirically calibrated formula:
+   `width = 27 × effective_chars + 80` pt, where emoji (U+1F300–U+1FAFF and
+   U+2600–U+27BF) count as 2 effective characters because iOS renders them at
+   roughly twice the width of a regular glyph.
+
+2. **Column count** is derived from the widest button width and the assumed
+   screen width (default 2800 pt):
+   `columns = floor((screen_width − x_start) / (button_width + gap))`
+
+3. **Spacing** is then distributed evenly ("justified") so that columns span
+   the full screen width:
+   `spacing = (screen_width − x_start − button_width) / (columns − 1)`
+
+Both `columns` and `spacing` can be overridden via `--midi-columns` and
+`--midi-spacing` on the command line.
+
+### Emoji compatibility in Smart Button labels
+
+When MIDI preset names in forScore contain **Unicode 14+ emoji** (codepoints
+U+1FA00–U+1FFFF), migrating them to MobileSheets Smart Buttons causes the app
+to **crash** when the song is opened. The crash is a Swift forced-unwrap on
+`nil` triggered by MobileSheets' emoji renderer encountering an unknown
+codepoint.
+
+Affected emoji include symbols added in Unicode 14.0 (2021) and later, for example:
+
+| Emoji | Codepoint | Name           | Unicode version |
+|-------|-----------|----------------|-----------------|
+| 🪈    | U+1FA88   | Flute          | 14.0 (2021)     |
+| 🪗    | U+1FA97   | Accordion      | 13.0 (2020)     |
+| 🪕    | U+1FA95   | Banjo          | 12.0 (2019)     |
+
+`forScore2MS.py` automatically strips all codepoints in the range U+1FA00–U+1FFFF
+from Smart Button labels during import. Affected preset names lose their leading
+emoji but remain otherwise intact (e.g. `🪈 Flute Vib C` → `Flute Vib C`).

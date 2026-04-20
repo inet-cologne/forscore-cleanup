@@ -184,14 +184,37 @@ python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb" --dry-run
 | `-o, --output` | Output directory (default: `<input-stem>-2MS/` next to input) |
 | `--dry-run` | Parse and report without writing any database |
 | `-v, --verbose` | Print each inserted song title |
+| `--midi-presets` | Import forScore MIDI presets as Smart Buttons |
+| `--midi-song TITLE` | Attach Smart Buttons to an existing song with this title |
+| `--midi-presets-new-song TITLE` | Create a new placeholder song and attach Smart Buttons to it |
+| `--midi-columns N` | Override the number of Smart Button columns (default: auto) |
+| `--midi-spacing PT` | Override the horizontal spacing between buttons in points (default: auto) |
+
+The button grid layout is computed automatically: the widest label determines the button width (emoji count as double-width characters), which is used to derive the optimal column count and spacing so that buttons fill the available screen width without overlapping.
 
 **What is imported:**
 - Songs — every PDF with full metadata
 - Bookmarks — each becomes a virtual song (page-range slice of a PDF)
 - Setlists — all setlists with song membership and display order
 - Audio links — linked MP3/M4A tracks
+- MIDI presets — as Smart Buttons (requires `--midi-presets`)
+
+> **Note — Emoji compatibility:**
+> MobileSheets cannot render Unicode 14+ emoji (e.g. `🪈` U+1FA88 "Flute", added in 2021).
+> Opening a song whose Smart Button labels contain such emoji causes the app to crash.
+> `forScore2MS.py` automatically strips these characters from Smart Button labels during import.
+> If you use newer emoji in forScore MIDI preset names, they will be silently removed.
 
 **Output:** `<input-stem>-2MS/MobileSheets.db` — importable by the MobileSheets app.
+
+> **Important — MobileSheets import steps:**
+> After copying `MobileSheets.db` to your device, MobileSheets will **not** pick it up automatically.
+> You must:
+> 1. Close MobileSheets completely (force-quit the app).
+> 2. Reopen MobileSheets.
+> 3. Go to **Settings → Library** and switch to the library that contains the new database.
+>
+> Only after this library switch will all songs, setlists and Smart Buttons appear.
 
 ---
 
