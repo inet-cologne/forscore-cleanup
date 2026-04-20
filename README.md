@@ -8,7 +8,7 @@ Until today: no fixes, no helpful support and no interest in the issues from the
 **The good news:**
 I did reverse engineering research and developed a few helpful tools.
 I have 3 ready scripts and a 4th in testing to help on getting rid of the duplicates and reusing data in forScore, and to extract/prepare and transform your data for raw backup purposes and for use in other apps like MobileSheets.
-They all work with an exported `Archiv*.4sb` file (or `Backup*.4sb` for metadata-only operations).
+They all work with an exported `Archiv*.4sb` / `Archive*.4sb` file (or `Backup*.4sb` for metadata-only operations).
 
 ---
 
@@ -204,7 +204,7 @@ Creating backups within forScore puts all data in a single `.4sb` file:
 | Type | Filename prefix | Version | Contents |
 |------|----------------|---------|----------|
 | Backup | `Backup*.4sb` | `4SBV02` | Metadata only (bookmarks, setlists, text annotations) |
-| Archive | `Archiv*.4sb` | `4SBV03` | Metadata + all PDFs, audio files, PNG draw annotations |
+| Archive | `Archiv*.4sb` / `Archive*.4sb` | `4SBV03` | Metadata + all PDFs, audio files, PNG draw annotations |
 
 Both use the same internal structure: a fixed 74-byte ASCII header, followed by a gzip-compressed Apple Binary Property List (bplist) containing all metadata, followed by a sequence of gzip-compressed file records (V03 only).
 

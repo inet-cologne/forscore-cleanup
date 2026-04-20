@@ -11,13 +11,14 @@ forScore on iPadOS and is intended as a reference for tooling and future work.
 forScore produces two types of `.4sb` file, distinguished by version marker and
 content:
 
-| Type    | Filename prefix | Version marker | Contains                                      |
-|---------|-----------------|----------------|-----------------------------------------------|
-| Backup  | `Backup`        | `4SBV02`       | Metadata only (plist)  +  drawing annotations |
-| Archive | `Archiv`        | `4SBV03`       | Metadata (plist)  +  drawings  +  all PDFs and audio files |
+| Type    | Filename prefix        | Version marker | Contains                                      |
+|---------|------------------------|----------------|-----------------------------------------------|
+| Backup  | `Backup`               | `4SBV02`       | Metadata only (plist)  +  drawing annotations |
+| Archive | `Archiv` / `Archive`   | `4SBV03`       | Metadata (plist)  +  drawings  +  all PDFs and audio files |
 
-Both share the same outer structure: a fixed ASCII file header, followed by a
-gzip-compressed metadata block, followed by a sequence of embedded-file records.
+Both share the same outer structure: an ASCII file header of variable length,
+followed by a gzip-compressed metadata block, followed by a sequence of
+embedded-file records.
 
 ---
 
@@ -25,10 +26,10 @@ gzip-compressed metadata block, followed by a sequence of embedded-file records.
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│  74-byte ASCII file header                                     │
+│  ASCII file header  (variable length, typically 74–75 bytes)   │
 ├────────────────────────────────────────────────────────────────┤
 │  Metadata block  (gzip-compressed Apple Binary plist)          │
-│  Size given in file header                                     │
+│  Size given in file header                                      │
 ├────────────────────────────────────────────────────────────────┤
 │  Record 0:  ASCII record header  (variable length)             │
 │             gzip-compressed file data  (compressed_size bytes) │
@@ -41,12 +42,27 @@ gzip-compressed metadata block, followed by a sequence of embedded-file records.
 
 ---
 
-## 1. File Header (74 bytes, ASCII)
+## 1. File Header (variable length, ASCII)
 
-The file starts with a fixed 74-byte ASCII header. Example:
+The file starts with an ASCII header that ends immediately before the first gzip
+magic byte sequence (`\x1f\x8b\x08`). The length depends on the locale of the
+forScore app:
+
+| Locale  | Filename in header              | Header length |
+|---------|---------------------------------|---------------|
+| German  | `Archiv 2026-04-12 16-00-52.4sb` | 74 bytes     |
+| English | `Archive 2026-04-16 …4sb`        | 75 bytes     |
+
+Example (German, 74 bytes):
 
 ```
 <--4SBV03-->              30         3224329Archiv 2026-04-12 16-00-52.4sb
+```
+
+Example (English, 75 bytes):
+
+```
+<--4SBV03-->              31         1900869Archive 2026-04-16 16-38-32.4sb
 ```
 
 Structure (fields separated by spaces, right-aligned within their columns):
@@ -58,30 +74,35 @@ Structure (fields separated by spaces, right-aligned within their columns):
 | Metadata size      | `3224329`                             | Byte length of the following metadata gzip block |
 | Original filename  | `Archiv 2026-04-12 16-00-52.4sb`     | The filename as created by forScore            |
 
-The metadata block starts at byte offset **74** and ends at offset
-`74 + metadata_size`.
+The metadata block starts immediately after the header (at the gzip magic byte)
+and ends at offset `gzip_start + metadata_size`.
 
-**Parsing:**
+**Parsing — find gzip start dynamically:**
 
 ```python
-header_str = open(path, 'rb').read(74).decode('ascii')
+with open(path, 'rb') as f:
+    window = f.read(256)
+gz_start = window.index(b'\x1f\x8b\x08')   # do not assume fixed offset
+header_str = window[:gz_start].decode('ascii')
 match = re.search(r'(\d{5,12})(Backup|Archiv)', header_str)
 metadata_size = int(match.group(1))
-metadata_end  = 74 + metadata_size
+metadata_end  = gz_start + metadata_size
 ```
 
 ---
 
 ## 2. Metadata Block (gzip + Apple Binary plist)
 
-Bytes `74` through `74 + metadata_size - 1` form a single gzip stream containing
-an **Apple Binary Property List** (bplist00 format).
+Bytes `gz_start` through `gz_start + metadata_size - 1` form a single gzip
+stream containing an **Apple Binary Property List** (bplist00 format).
 
 ```python
 import gzip, plistlib
-raw_gz   = open(path, 'rb').read()[74 : 74 + metadata_size]
+with open(path, 'rb') as f:
+    f.seek(gz_start)
+    raw_gz = f.read(metadata_size)
 raw_plist = gzip.decompress(raw_gz)
-plist    = plistlib.loads(raw_plist)   # returns a dict
+plist     = plistlib.loads(raw_plist)   # returns a dict
 ```
 
 **Observed sizes (example file):**
@@ -368,7 +389,7 @@ cleaned plist has different byte offsets from the original).
 
 | Constant                  | Value  | Description                                  |
 |---------------------------|--------|----------------------------------------------|
-| File header size          | 74     | Fixed ASCII header at byte 0                 |
+| File header size          | 74–75 bytes | Variable; ends at first gzip magic (`\x1f\x8b\x08`) |
 | Version marker (Backup)   | `4SBV02` | gzip+plist only, small file               |
 | Version marker (Archive)  | `4SBV03` | gzip+plist + all PDFs/audio               |
 | Record header prefix size | 32     | Fixed-width numeric prefix in record headers |

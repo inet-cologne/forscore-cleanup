@@ -51,7 +51,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-HEADER_SIZE = 74
+HEADER_SIZE = 74   # kept for reference; actual gzip offset is found dynamically
+_HEADER_SEARCH_WINDOW = 256
 
 # forScore key encoding: 0-11 = major, 100-111 = minor (repeated in steps of 100)
 MAJOR_KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
@@ -63,12 +64,20 @@ MINOR_KEYS = ['Cm', 'Dbm', 'Dm', 'Ebm', 'Em', 'Fm', 'F#m', 'Gm', 'Abm', 'Am', 'B
 # ---------------------------------------------------------------------------
 def read_plist_from_4sb(filepath: str) -> dict:
     """
-    Read the 74-byte header, determine metadata size, decompress the metadata
+    Read the file header, determine metadata size, decompress the metadata
     gzip block, and return the parsed plist dict.
+
+    The gzip start offset is found dynamically (not assumed to be 74) to
+    support both 'Archiv' (74-byte header) and 'Archive' (75-byte header).
     """
     with open(filepath, 'rb') as f:
-        header = f.read(HEADER_SIZE).decode('ascii', errors='replace')
+        window = f.read(_HEADER_SEARCH_WINDOW)
 
+    gz_idx = window.find(b'\x1f\x8b\x08')
+    if gz_idx == -1:
+        raise ValueError('gzip magic not found in file header area.')
+
+    header = window[:gz_idx].decode('ascii', errors='replace')
     m = re.search(r'(\d{5,12})(Backup|Archiv)', header)
     if not m:
         raise ValueError(f"Cannot parse metadata size from file header: {header!r}")
@@ -76,7 +85,7 @@ def read_plist_from_4sb(filepath: str) -> dict:
     metadata_size = int(m.group(1))
 
     with open(filepath, 'rb') as f:
-        f.seek(HEADER_SIZE)
+        f.seek(gz_idx)
         gz_bytes = f.read(metadata_size)
 
     raw = gzip.decompress(gz_bytes)
@@ -602,7 +611,7 @@ def validate_input(filepath: str) -> None:
     if p.suffix.lower() != '.4sb':
         sys.exit(f'Error: expected a .4sb file, got: {p.name}')
     with open(filepath, 'rb') as f:
-        header = f.read(HEADER_SIZE).decode('ascii', errors='replace')
+        header = f.read(_HEADER_SEARCH_WINDOW).decode('ascii', errors='replace')
     if '4SBV02' not in header and '4SBV03' not in header:
         sys.exit(
             'Error: file does not appear to be a forScore .4sb file '

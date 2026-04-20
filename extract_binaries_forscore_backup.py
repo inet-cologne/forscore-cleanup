@@ -91,13 +91,31 @@ def detect_extension(data: bytes) -> str:
 # ---------------------------------------------------------------------------
 # forScore header parsing
 # ---------------------------------------------------------------------------
-FORSCORE_HEADER_SIZE = 74   # fixed ASCII header at start of file
+_HEADER_SEARCH_WINDOW = 256   # bytes to scan for gzip magic at file start
+
+
+def _find_header_gzip_start(filepath: str) -> int:
+    """
+    Return the byte offset of the first gzip magic byte sequence (\\x1f\\x8b\\x08)
+    in the file header area.  This is the start of the compressed metadata block.
+
+    The marker sits right after the ASCII header whose length varies between
+    forScore versions/locales (e.g. 74 bytes for 'Archiv', 75 bytes for 'Archive').
+    """
+    with open(filepath, 'rb') as f:
+        buf = f.read(_HEADER_SEARCH_WINDOW)
+    idx = buf.find(b'\x1f\x8b\x08')
+    if idx == -1:
+        raise ValueError('gzip magic not found in file header area.')
+    return idx
 
 
 def read_metadata_end(filepath: str) -> int:
     """Return the byte offset where the metadata gzip block ends."""
+    gzip_start = _find_header_gzip_start(filepath)
+
     with open(filepath, 'rb') as f:
-        header_bytes = f.read(FORSCORE_HEADER_SIZE)
+        header_bytes = f.read(gzip_start)
 
     header_str = header_bytes.decode('ascii', errors='replace')
     match = re.search(r'(\d{5,12})(Backup|Archiv)', header_str)
@@ -105,7 +123,7 @@ def read_metadata_end(filepath: str) -> int:
         raise ValueError("Cannot parse metadata size from file header.")
 
     metadata_size = int(match.group(1))
-    return FORSCORE_HEADER_SIZE + metadata_size
+    return gzip_start + metadata_size
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +132,15 @@ def read_metadata_end(filepath: str) -> int:
 
 def _read_plist_from_4sb(filepath: str) -> dict:
     """Read and return the metadata plist from a .4sb file."""
+    gzip_start = _find_header_gzip_start(filepath)
     with open(filepath, 'rb') as f:
-        header = f.read(FORSCORE_HEADER_SIZE).decode('ascii', errors='replace')
+        header = f.read(gzip_start).decode('ascii', errors='replace')
     m = re.search(r'(\d{5,12})(Backup|Archiv)', header)
     if not m:
         raise ValueError('Cannot parse metadata size from file header.')
     metadata_size = int(m.group(1))
     with open(filepath, 'rb') as f:
-        f.seek(FORSCORE_HEADER_SIZE)
+        f.seek(gzip_start)
         raw = gzip.decompress(f.read(metadata_size))
     if raw[:8] != b'bplist00':
         raise ValueError('Metadata block is not a binary plist.')
@@ -605,13 +624,13 @@ def validate_input(filepath: str) -> None:
     p = Path(filepath)
     if not p.exists():
         sys.exit(f'Error: file not found: {filepath}')
-    if not p.name.startswith('Archiv') or p.suffix.lower() != '.4sb':
+    if not p.name.startswith(('Archiv', 'Archive')) or p.suffix.lower() != '.4sb':
         sys.exit(
-            f'Error: expected an Archive file whose name starts with "Archiv" '
+            f'Error: expected an Archive file whose name starts with "Archiv" or "Archive" '
             f'and ends with ".4sb", got: {p.name}'
         )
     with open(filepath, 'rb') as f:
-        header = f.read(74).decode('ascii', errors='replace')
+        header = f.read(_HEADER_SEARCH_WINDOW).decode('ascii', errors='replace')
     if '<--4SBV03-->' not in header:
         sys.exit(
             'Error: file does not appear to be a V03 Archive '

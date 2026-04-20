@@ -52,7 +52,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-HEADER_SIZE        = 74          # fixed ASCII file header
+_HEADER_SEARCH_WINDOW = 256     # bytes to scan for gzip magic at file start
 NUMERIC_PREFIX_LEN = 32          # fixed-width numeric prefix in each record header
 DOCUMENTS_PREFIX   = '{%DOCUMENTS_DIR%}/'
 AUX_PREFIX         = '{%AUX_DIR%}/'
@@ -110,19 +110,26 @@ def _bar(current: int, total: int, width: int = 35) -> str:
 # ---------------------------------------------------------------------------
 def read_file_header(filepath: str) -> dict:
     """
-    Read and parse the 74-byte ASCII file header.
+    Read and parse the ASCII file header (variable length, ends at first gzip magic).
 
     Returns a dict with keys:
         version             - '4SBV02' or '4SBV03'
         is_archive          - True for V03
         is_backup           - True for V02
         metadata_size       - byte length of the metadata gzip block
+        gzip_start          - byte offset of the metadata gzip block
         metadata_end        - byte offset where the record section begins
-        raw                 - the raw 74-byte header bytes
+        raw                 - the raw header bytes (up to gzip magic)
         filename_in_header  - original filename embedded in the header
     """
     with open(filepath, 'rb') as f:
-        raw = f.read(HEADER_SIZE)
+        window = f.read(_HEADER_SEARCH_WINDOW)
+
+    gz_idx = window.find(b'\x1f\x8b\x08')
+    if gz_idx == -1:
+        raise ValueError('gzip magic not found in file header area.')
+
+    raw  = window[:gz_idx]
     text = raw.decode('ascii', errors='replace')
 
     m = re.search(r'(\d{5,12})(Backup|Archiv)', text)
@@ -130,7 +137,7 @@ def read_file_header(filepath: str) -> dict:
         raise ValueError(f"Cannot parse metadata size from file header: {text!r}")
 
     metadata_size = int(m.group(1))
-    metadata_end  = HEADER_SIZE + metadata_size
+    metadata_end  = gz_idx + metadata_size
 
     version_match = re.search(r'4SBV0[23]', text)
     version       = version_match.group(0) if version_match else 'Unknown'
@@ -143,6 +150,7 @@ def read_file_header(filepath: str) -> dict:
         'is_archive':         version == '4SBV03',
         'is_backup':          version == '4SBV02',
         'metadata_size':      metadata_size,
+        'gzip_start':         gz_idx,
         'metadata_end':       metadata_end,
         'raw':                raw,
         'filename_in_header': filename_in_header,
@@ -151,9 +159,10 @@ def read_file_header(filepath: str) -> dict:
 
 def rebuild_header(original_raw: bytes, new_metadata_size: int) -> bytes:
     """
-    Return a new 74-byte header identical to original_raw except the metadata
-    size field is updated.  Header length (74 bytes) is preserved exactly.
+    Return a header identical to original_raw except the metadata size field is
+    updated.  The byte length of original_raw is preserved exactly.
     """
+    header_size = len(original_raw)
     text = original_raw.decode('ascii', errors='replace')
     m    = re.search(r'(\d{5,12})(Backup|Archiv)', text)
     if not m:
@@ -166,23 +175,23 @@ def rebuild_header(original_raw: bytes, new_metadata_size: int) -> bytes:
     padded   = new_str.rjust(len(old_str)) if len(new_str) <= len(old_str) else new_str
     new_text = text[:m.start(1)] + padded + text[m.end(1):]
 
-    # Truncate or pad to exactly HEADER_SIZE bytes
+    # Truncate or pad to exactly header_size bytes
     encoded = new_text.encode('ascii', errors='replace')
-    if len(encoded) < HEADER_SIZE:
-        encoded = encoded + b' ' * (HEADER_SIZE - len(encoded))
-    elif len(encoded) > HEADER_SIZE:
-        encoded = encoded[:HEADER_SIZE]
+    if len(encoded) < header_size:
+        encoded = encoded + b' ' * (header_size - len(encoded))
+    elif len(encoded) > header_size:
+        encoded = encoded[:header_size]
     return encoded
 
 
 # ---------------------------------------------------------------------------
 # Metadata (plist) extraction
 # ---------------------------------------------------------------------------
-def read_plist(filepath: str, metadata_end: int) -> dict:
+def read_plist(filepath: str, metadata_end: int, gzip_start: int) -> dict:
     """Read and decompress the metadata block; return the parsed plist dict."""
-    metadata_size = metadata_end - HEADER_SIZE
+    metadata_size = metadata_end - gzip_start
     with open(filepath, 'rb') as f:
-        f.seek(HEADER_SIZE)
+        f.seek(gzip_start)
         gz_bytes = f.read(metadata_size)
     raw_plist = gzip.decompress(gz_bytes)
     if raw_plist[:8] != b'bplist00':
@@ -552,7 +561,7 @@ def validate_input(filepath: str) -> None:
     if p.suffix.lower() != '.4sb':
         sys.exit(f'Error: expected a .4sb file, got: {p.name}')
     with open(filepath, 'rb') as f:
-        header = f.read(HEADER_SIZE).decode('ascii', errors='replace')
+        header = f.read(_HEADER_SEARCH_WINDOW).decode('ascii', errors='replace')
     if '4SBV02' not in header and '4SBV03' not in header:
         sys.exit(
             f'Error: file does not appear to be a forScore .4sb file '
@@ -660,7 +669,7 @@ def main():
     # --- Read and parse plist ------------------------------------------------
     print('Reading metadata...')
     try:
-        plist = read_plist(str(p), hdr['metadata_end'])
+        plist = read_plist(str(p), hdr['metadata_end'], hdr['gzip_start'])
     except Exception as e:
         sys.exit(f'Error reading metadata plist: {e}')
     print(f'  Parsed plist: {len(plist):,} top-level keys')
