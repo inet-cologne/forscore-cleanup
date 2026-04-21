@@ -7,7 +7,7 @@ Until today: no fixes, no helpful support and no interest in the issues from the
 
 **The good news:**
 I did reverse engineering research and developed a few helpful tools.
-I have 3 ready scripts and a 4th in testing to help on getting rid of the duplicates and reusing data in forScore, and to extract/prepare and transform your data for raw backup purposes and for use in other apps like MobileSheets.
+I created a few scripts to help on getting rid of the duplicates and to extract/prepare and transform your forScore data for raw backup purposes and for use in other apps like MobileSheets.
 They all work with an exported `Archiv*.4sb` / `Archive*.4sb` file (or `Backup*.4sb` for metadata-only operations).
 
 ---
