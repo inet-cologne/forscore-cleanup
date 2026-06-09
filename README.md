@@ -195,6 +195,7 @@ The button grid layout is computed automatically: the widest label determines th
 **What is imported:**
 - Songs — every PDF with full metadata
 - Bookmarks — each becomes a virtual song (page-range slice of a PDF)
+- PDF files — each distinct PDF file gets an additional song entry with title = filename without extension
 - Setlists — all setlists with song membership and display order
 - Audio links — linked MP3/M4A tracks
 - MIDI presets — as Smart Buttons (requires `--midi-presets`)

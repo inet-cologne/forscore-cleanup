@@ -160,12 +160,17 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
     """
     Build a flat list of song dicts from the plist.
 
-    For each PDF that has '|bookmarks', each bookmark becomes a song entry
-    with its own page range.  PDFs without bookmarks become whole-PDF entries.
-    Both types are included.
+    Three types of entries are produced:
+
+    'bookmark'  — one entry per bookmark inside a multi-song PDF
+    'single'    — one entry per standalone single-PDF score (forScore title)
+    'pdf'       — one additional entry per distinct PDF file, with
+                  title = filename without extension.  This covers both
+                  bookmark-host PDFs and single-PDF scores, giving every
+                  raw file its own song entry.
 
     Returns a list of dicts with keys:
-        type        - 'bookmark' or 'single'
+        type        - 'bookmark', 'single', or 'pdf'
         filepath    - PDF filename (e.g. 'My Song.pdf')
         title       - display title
         first_page  - 1-based first page (int)
@@ -180,6 +185,7 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
     """
     songs = []
     bookmark_pdfs: set[str] = set()
+    all_pdf_files: set[str] = set()   # every distinct PDF filename seen
 
     # --- Pass 1: bookmarks ---------------------------------------------------
     for key, value in plist.items():
@@ -187,6 +193,7 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
             continue
         filepath = key[:-len('|bookmarks')]
         bookmark_pdfs.add(filepath)
+        all_pdf_files.add(filepath)
 
         for bm in value:
             if not isinstance(bm, dict):
@@ -220,6 +227,7 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
         if not (filepath.lower().endswith('.pdf') or filepath.lower().endswith('.PDF')):
             continue
 
+        all_pdf_files.add(filepath)
         title = value or filepath.rsplit('.', 1)[0]
 
         songs.append({
@@ -228,6 +236,27 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
             'title':      title,
             'first_page': 1,
             'last_page':  -1,   # -1 = whole PDF
+            'composer':   plist.get(f'{filepath}|composer', '') or '',
+            'genre':      plist.get(f'{filepath}|genre', '') or '',
+            'keyword':    plist.get(f'{filepath}|keywords', '') or '',
+            'key':        decode_key(plist.get(f'{filepath}|key')),
+            'signature':  decode_signature(plist.get(f'{filepath}|signature')),
+            'bpm':        decode_bpm(plist.get(f'{filepath}|bpm')),
+            'identifier': '',
+        })
+
+    # --- Pass 3: one 'pdf' entry per distinct PDF file ----------------------
+    # Title = filename without extension (e.g. "Real Book Vol 1" for
+    # "Real Book Vol 1.pdf").  These entries always reference the whole file
+    # (last_page = -1) so MobileSheets can open the raw PDF directly.
+    for filepath in sorted(all_pdf_files):
+        stem = filepath.rsplit('.', 1)[0] if '.' in filepath else filepath
+        songs.append({
+            'type':       'pdf',
+            'filepath':   filepath,
+            'title':      stem,
+            'first_page': 1,
+            'last_page':  -1,
             'composer':   plist.get(f'{filepath}|composer', '') or '',
             'genre':      plist.get(f'{filepath}|genre', '') or '',
             'keyword':    plist.get(f'{filepath}|keywords', '') or '',
@@ -1199,7 +1228,8 @@ def main():
     songs = extract_songs_and_bookmarks(plist)
     n_bookmarks = sum(1 for s in songs if s['type'] == 'bookmark')
     n_singles   = sum(1 for s in songs if s['type'] == 'single')
-    print(f'  {len(songs):,} songs total  ({n_bookmarks:,} bookmarks, {n_singles:,} single PDFs)')
+    n_pdfs      = sum(1 for s in songs if s['type'] == 'pdf')
+    print(f'  {len(songs):,} songs total  ({n_bookmarks:,} bookmarks, {n_singles:,} single PDFs, {n_pdfs:,} PDF files)')
 
     print('Extracting setlists...')
     setlists = extract_setlists(plist)
@@ -1377,6 +1407,7 @@ def main():
     print(f'  Songs inserted:   {len(songs) - errors:,}')
     print(f'    Bookmarks:      {n_bookmarks:,}')
     print(f'    Single PDFs:    {n_singles:,}')
+    print(f'    PDF files:      {n_pdfs:,}')
     print(f'  Setlists:         {len(setlists):,}')
     print(f'  SL assignments:   {sl_assigned:,}')
     print(f'  Audio tracks:     {total_tracks:,}')
