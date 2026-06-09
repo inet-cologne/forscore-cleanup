@@ -185,7 +185,6 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
     """
     songs = []
     bookmark_pdfs: set[str] = set()
-    all_pdf_files: set[str] = set()   # every distinct PDF filename seen
 
     # --- Pass 1: bookmarks ---------------------------------------------------
     for key, value in plist.items():
@@ -193,7 +192,6 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
             continue
         filepath = key[:-len('|bookmarks')]
         bookmark_pdfs.add(filepath)
-        all_pdf_files.add(filepath)
 
         for bm in value:
             if not isinstance(bm, dict):
@@ -227,7 +225,6 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
         if not (filepath.lower().endswith('.pdf') or filepath.lower().endswith('.PDF')):
             continue
 
-        all_pdf_files.add(filepath)
         title = value or filepath.rsplit('.', 1)[0]
 
         songs.append({
@@ -245,11 +242,13 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
             'identifier': '',
         })
 
-    # --- Pass 3: one 'pdf' entry per distinct PDF file ----------------------
-    # Title = filename without extension (e.g. "Real Book Vol 1" for
-    # "Real Book Vol 1.pdf").  These entries always reference the whole file
-    # (last_page = -1) so MobileSheets can open the raw PDF directly.
-    for filepath in sorted(all_pdf_files):
+    # --- Pass 3: one 'pdf' entry per PDF that hosts bookmarks ---------------
+    # For bookmark-host PDFs (e.g. Real Books), we also want a whole-file
+    # entry so MobileSheets can open the raw PDF directly.
+    # Single-PDF scores are excluded: their 'single' entry already covers the
+    # whole file (and typically has the same title as the filename), so adding
+    # a 'pdf' entry would create a duplicate.
+    for filepath in sorted(bookmark_pdfs):
         stem = filepath.rsplit('.', 1)[0] if '.' in filepath else filepath
         songs.append({
             'type':       'pdf',
