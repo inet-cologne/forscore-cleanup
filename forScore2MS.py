@@ -64,6 +64,7 @@ import plistlib
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -81,6 +82,29 @@ _HEADER_SEARCH_WINDOW = 256
 # forScore key encoding: 0-11 = major, 100-111 = minor (repeated in steps of 100)
 MAJOR_KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
 MINOR_KEYS = ['Cm', 'Dbm', 'Dm', 'Ebm', 'Em', 'Fm', 'F#m', 'Gm', 'Abm', 'Am', 'Bbm', 'Bm']
+
+
+# ---------------------------------------------------------------------------
+# PDF page count helper (macOS only — uses mdls, no external Python libs)
+# ---------------------------------------------------------------------------
+def get_pdf_page_count(pdf_path: Path) -> int:
+    """Return the number of pages in a PDF using macOS Spotlight metadata.
+    Returns 0 if the file does not exist or the page count cannot be determined.
+    """
+    if not pdf_path.exists():
+        return 0
+    try:
+        r = subprocess.run(
+            ['mdls', '-name', 'kMDItemNumberOfPages', str(pdf_path)],
+            capture_output=True, text=True, timeout=5,
+        )
+        val = r.stdout.strip().split('=')[-1].strip()
+        if val and val != '(null)':
+            return int(val)
+    except Exception:
+        pass
+    return 0
+
 
 
 # ---------------------------------------------------------------------------
@@ -670,11 +694,12 @@ class MobileSheetsDB:
         self.conn.commit()
 
         # In-memory caches to avoid duplicate lookups
-        self._composers:  dict[str, int] = {}
-        self._genres:     dict[str, int] = {}
-        self._keys:       dict[str, int] = {}
-        self._signatures: dict[str, int] = {}
-        self._setlists:   dict[str, int] = {}
+        self._composers:   dict[str, int] = {}
+        self._genres:      dict[str, int] = {}
+        self._keys:        dict[str, int] = {}
+        self._signatures:  dict[str, int] = {}
+        self._setlists:    dict[str, int] = {}
+        self._collections: dict[str, int] = {}
 
     # --- Lookup-or-create helpers -------------------------------------------
 
@@ -708,14 +733,29 @@ class MobileSheetsDB:
     def _setlist_id(self, name: str) -> int | None:
         return self._get_or_create(self._setlists, 'Setlists', 'Name', name)
 
+    def _collection_id(self, name: str) -> int | None:
+        return self._get_or_create(self._collections, 'Collections', 'Name', name)
+
     # --- Song insertion ------------------------------------------------------
 
-    def insert_song(self, song: dict, audio_tracks: list | None = None) -> int:
+    def insert_song(self, song: dict, audio_tracks: list | None = None,
+                    page_count: int = 0) -> int:
         """
         Insert a song and all associated metadata rows.
+
+        page_count  -- total pages in the PDF.  Used for whole-file entries
+                       (last_page == -1) to set Songs.LastPage and
+                       Files.SourceFilePageCount so MobileSheets allows
+                       scrolling through the entire document.  Pass 0 to
+                       leave both fields as 0 (MobileSheets still opens the
+                       file but may default to page 1 only).
+
         Returns the new Songs.Id.
         """
         now = int(time.time() * 1000)
+
+        # For whole-file entries, use page_count as LastPage if available.
+        last_page_val = page_count if (song['last_page'] == -1 and page_count > 0) else 0
 
         self.cursor.execute(
             """
@@ -723,12 +763,13 @@ class MobileSheetsDB:
                 (Title, Difficulty, Custom, Custom2, LastPage, OrientationLock,
                  Duration, Stars, VerticalZoom, SortTitle, Sharpen, SharpenLevel,
                  Keywords, AutoStartAudio, CreationDate, LastModified, SongId)
-            VALUES (?, 0, ?, ?, 0, 0, 0, 0, 1.0, '', 0, 4, ?, 0, ?, ?, 0)
+            VALUES (?, 0, ?, ?, ?, 0, 0, 0, 1.0, '', 0, 4, ?, 0, ?, ?, 0)
             """,
             (
                 song['title'],
                 song['filepath'],                                        # Custom = filepath
                 song.get('identifier') or str(uuid.uuid4()),            # Custom2 = UUID
+                last_page_val,
                 song.get('keyword', '') or '',
                 now,
                 now,
@@ -751,9 +792,9 @@ class MobileSheetsDB:
             INSERT INTO Files
                 (Id, SongId, Path, PageOrder, Type, Source, LastModified,
                  FileSize, SourceFilePageCount, FileHash, Width, Height)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, -1, -1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, -1, -1)
             """,
-            (song_id, song_id, song['filepath'], page_order, 1, 1, now),
+            (song_id, song_id, song['filepath'], page_order, 1, 1, now, last_page_val),
         )
 
         # --- Composer (pipe-separated list supported) -----------------------
@@ -845,6 +886,17 @@ class MobileSheetsDB:
             self.cursor.execute(
                 'INSERT INTO SetlistSong (SetlistId, SongId) VALUES (?, ?)',
                 (slid, song_id),
+            )
+
+    def add_to_collection(self, collection_name: str, song_id: int) -> None:
+        """Add a song to a MobileSheets Collection (= "Sammlung").
+        The collection is created if it does not yet exist.
+        """
+        cid = self._collection_id(collection_name)
+        if cid:
+            self.cursor.execute(
+                'INSERT INTO CollectionSong (CollectionId, SongId) VALUES (?, ?)',
+                (cid, song_id),
             )
 
     def insert_midi_presets_as_smart_buttons(
@@ -1202,6 +1254,25 @@ def main():
             'Override if buttons overlap or to force a specific layout.'
         ),
     )
+    parser.add_argument(
+        '--pdf-dir', metavar='DIR',
+        help=(
+            'Directory containing the extracted PDF files (e.g. the pdf/ '
+            'subfolder from extract_binaries_forscore_backup.py). '
+            'When provided, the page count of each PDF is read via mdls '
+            'and stored in Songs.LastPage and Files.SourceFilePageCount, '
+            'enabling full scrolling in MobileSheets for whole-file entries.'
+        ),
+    )
+    parser.add_argument(
+        '--pdf-collection', metavar='NAME', default='',
+        help=(
+            'Add all "pdf" whole-file entries (one per bookmark-host PDF) '
+            'to a MobileSheets Collection (Sammlung) with this name. '
+            'The collection is created if it does not exist. '
+            'Example: --pdf-collection "Books"'
+        ),
+    )
     args = parser.parse_args()
 
     validate_input(args.input)
@@ -1285,6 +1356,9 @@ def main():
     print('Creating MobileSheets database...')
     db = MobileSheetsDB(str(db_path))
 
+    # Optional PDF directory for page-count lookup
+    pdf_dir = Path(args.pdf_dir).resolve() if args.pdf_dir else None
+
     # Build a lookup: (filepath, title) -> song_id  for setlist assignment
     song_id_map: dict[tuple, int] = {}
 
@@ -1293,10 +1367,21 @@ def main():
 
     for i, song in enumerate(songs, 1):
         try:
-            tracks   = audio_links.get(song['filepath'], [])
-            song_id  = db.insert_song(song, audio_tracks=tracks)
-            key      = (song['filepath'], song['title'])
+            tracks = audio_links.get(song['filepath'], [])
+
+            # For whole-file ('pdf' and 'single') entries, look up page count
+            # from the physical PDF if a pdf_dir was provided.
+            page_count = 0
+            if pdf_dir and song['last_page'] == -1:
+                page_count = get_pdf_page_count(pdf_dir / song['filepath'])
+
+            song_id = db.insert_song(song, audio_tracks=tracks, page_count=page_count)
+            key     = (song['filepath'], song['title'])
             song_id_map[key] = song_id
+
+            # Add 'pdf' whole-file entries to the requested collection
+            if song['type'] == 'pdf' and args.pdf_collection:
+                db.add_to_collection(args.pdf_collection, song_id)
 
             if args.verbose:
                 print(f'  [{i:>5}] {song["title"]}')
@@ -1412,6 +1497,8 @@ def main():
     print(f'  Audio tracks:     {total_tracks:,}')
     if n_midi_presets:
         print(f'  MIDI presets:     {n_midi_presets}  →  {n_midi_buttons} Smart Buttons, {n_midi_commands_ins} commands')
+    if args.pdf_collection:
+        print(f'  PDF collection:   "{args.pdf_collection}"  ({n_pdfs} entries)')
     print(f'  Errors:           {errors}')
     print()
     print(f'  Database:         {db_path}')
@@ -1422,8 +1509,8 @@ def main():
     print('=' * 52)
     print()
     print('Next steps:')
-    print('  1. Copy mobilesheets.db to your Android device')
-    print('  2. Replace the existing database in MobileSheets storage')
+    print('  1. Copy mobilesheets.db to your iPad/device')
+    print('  2. Switch library in MobileSheets to the new database')
     print('  3. Ensure all PDFs are present in the MobileSheets folder')
 
 
