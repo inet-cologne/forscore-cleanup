@@ -364,7 +364,10 @@ _DOCUMENTS_DIR_PREFIX = '{%DOCUMENTS_DIR%}/'
 
 def parse_record_header(filepath: str, pos: int) -> dict | None:
     """
-    Read and parse the ASCII record header at `pos`.
+    Read and parse the record header at `pos`.
+
+    The numeric prefix is ASCII; filenames are decoded as UTF-8, with Latin-1
+    retained as a fallback for legacy archives.
 
     Returns a dict with:
         filename        - original filename from header
@@ -385,20 +388,24 @@ def parse_record_header(filepath: str, pos: int) -> dict | None:
     if gz_idx == -1:
         return None
 
-    header_text = buf[:gz_idx].decode('latin-1', errors='replace')
-
     # Extract compressed_size from the fixed 32-char numeric prefix
-    numeric_part = header_text[:_NUMERIC_PREFIX_LEN]
+    header_bytes = buf[:gz_idx]
+    numeric_part = header_bytes[:_NUMERIC_PREFIX_LEN].decode('ascii', errors='replace')
     nums = re.findall(r'\d+', numeric_part)
     if not nums:
         return None
     compressed_size = int(nums[-1])   # last number = compressed_size
 
     # Extract filename from the rest (strip optional {%DOCUMENTS_DIR%}/ prefix)
-    path_part = header_text[_NUMERIC_PREFIX_LEN:]
-    if path_part.startswith(_DOCUMENTS_DIR_PREFIX):
-        path_part = path_part[len(_DOCUMENTS_DIR_PREFIX):]
-    filename = path_part.strip() or None
+    path_bytes = header_bytes[_NUMERIC_PREFIX_LEN:]
+    documents_dir_prefix = _DOCUMENTS_DIR_PREFIX.encode('ascii')
+    if path_bytes.startswith(documents_dir_prefix):
+        path_bytes = path_bytes[len(documents_dir_prefix):]
+    try:
+        filename = path_bytes.decode('utf-8').strip() or None
+    except UnicodeDecodeError:
+        # Preserve byte values for legacy headers that are not UTF-8 encoded.
+        filename = path_bytes.decode('latin-1').strip() or None
 
     gzip_start = pos + gz_idx
     return {
