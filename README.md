@@ -173,9 +173,19 @@ Annotations are not yet included and will be added in an upcoming version.
 ```bash
 python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb"
 
+# Override the PDF directory when files were extracted elsewhere
+python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb" --pdf-dir "/path/to/files"
+
 # Dry run — parse and report, write no database
 python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb" --dry-run
 ```
+
+By default, the importer looks for PDFs in `<archive name without .4sb>/files/`
+next to the archive. Use `--pdf-dir` if the files were extracted elsewhere. On
+macOS the importer reads each PDF's page count via `mdls`; whole-file songs get
+their full page range and bookmarks retain their own page ranges. Missing or
+unreadable PDFs are reported, but their songs and metadata are still imported
+with unknown page counts.
 
 **Options:**
 
@@ -183,6 +193,7 @@ python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb" --dry-run
 |--------|-------------|
 | `-o, --output` | Output directory (default: `<input-stem>-2MS/` next to input) |
 | `--dry-run` | Parse and report without writing any database |
+| `--pdf-dir DIR` | Override the default `<archive name>/files/` PDF directory (macOS) |
 | `-v, --verbose` | Print each inserted song title |
 | `--midi-presets` | Import forScore MIDI presets as Smart Buttons |
 | `--midi-song TITLE` | Attach Smart Buttons to an existing song with this title |

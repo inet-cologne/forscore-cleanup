@@ -743,12 +743,9 @@ class MobileSheetsDB:
         """
         Insert a song and all associated metadata rows.
 
-        page_count  -- total pages in the PDF.  Used for whole-file entries
-                       (last_page == -1) to set Songs.LastPage and
-                       Files.SourceFilePageCount so MobileSheets allows
-                       scrolling through the entire document.  Pass 0 to
-                       leave both fields as 0 (MobileSheets still opens the
-                       file but may default to page 1 only).
+        page_count  -- total pages in the PDF.  Sets Files.SourceFilePageCount
+                   for every entry and the full range for whole-file
+                   entries. Pass 0 when the count is unknown.
 
         Returns the new Songs.Id.
         """
@@ -779,7 +776,12 @@ class MobileSheetsDB:
 
         # --- Files entry (PDF association with page range) ------------------
         if song['last_page'] == -1:
-            page_order = ''   # empty = whole PDF
+            if page_count > 1:
+                page_order = f'1-{page_count}'
+            elif page_count == 1:
+                page_order = '1'
+            else:
+                page_order = ''
         elif song['first_page'] == song['last_page']:
             page_order = str(song['first_page'])
         else:
@@ -794,7 +796,7 @@ class MobileSheetsDB:
                  FileSize, SourceFilePageCount, FileHash, Width, Height)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, -1, -1)
             """,
-            (song_id, song_id, song['filepath'], page_order, 1, 1, now, last_page_val),
+            (song_id, song_id, song['filepath'], page_order, 1, 1, now, page_count),
         )
 
         # --- Composer (pipe-separated list supported) -----------------------
@@ -1257,11 +1259,11 @@ def main():
     parser.add_argument(
         '--pdf-dir', metavar='DIR',
         help=(
-            'Directory containing the extracted PDF files (e.g. the pdf/ '
-            'subfolder from extract_binaries_forscore_backup.py). '
-            'When provided, the page count of each PDF is read via mdls '
-            'and stored in Songs.LastPage and Files.SourceFilePageCount, '
-            'enabling full scrolling in MobileSheets for whole-file entries.'
+            'Directory containing the extracted PDF files (default: '
+            '<input-stem>/files/ next to the archive). '
+            'The page count of each PDF is read via mdls '
+            'and used for the full-document PageOrder, Songs.LastPage and '
+            'Files.SourceFilePageCount. Missing PDFs are reported but still imported.'
         ),
     )
     parser.add_argument(
@@ -1356,8 +1358,12 @@ def main():
     print('Creating MobileSheets database...')
     db = MobileSheetsDB(str(db_path))
 
-    # Optional PDF directory for page-count lookup
-    pdf_dir = Path(args.pdf_dir).resolve() if args.pdf_dir else None
+    pdf_dir = (Path(args.pdf_dir).resolve() if args.pdf_dir
+               else Path(args.input).resolve().with_suffix('') / 'files')
+    pdf_page_counts: dict[str, int] = {}
+    unknown_pdf_pages: dict[str, str] = {}
+    if not pdf_dir.is_dir():
+        print(f'  Warning: PDF directory not found: {pdf_dir}')
 
     # Build a lookup: (filepath, title) -> song_id  for setlist assignment
     song_id_map: dict[tuple, int] = {}
@@ -1369,11 +1375,15 @@ def main():
         try:
             tracks = audio_links.get(song['filepath'], [])
 
-            # For whole-file ('pdf' and 'single') entries, look up page count
-            # from the physical PDF if a pdf_dir was provided.
-            page_count = 0
-            if pdf_dir and song['last_page'] == -1:
-                page_count = get_pdf_page_count(pdf_dir / song['filepath'])
+            filepath = song['filepath']
+            if filepath not in pdf_page_counts:
+                pdf_path = pdf_dir / filepath
+                pdf_page_counts[filepath] = get_pdf_page_count(pdf_path)
+                if pdf_page_counts[filepath] <= 0:
+                    unknown_pdf_pages[filepath] = (
+                        'file missing' if not pdf_path.is_file() else 'page count unavailable'
+                    )
+            page_count = pdf_page_counts[filepath]
 
             song_id = db.insert_song(song, audio_tracks=tracks, page_count=page_count)
             key     = (song['filepath'], song['title'])
@@ -1395,6 +1405,10 @@ def main():
             errors += 1
 
     print(f'  {len(songs) - errors:,} songs inserted  ({errors} errors)')
+    if unknown_pdf_pages:
+        print(f'  Warning: page count unavailable for {len(unknown_pdf_pages)} PDFs; metadata retained:')
+        for filepath, reason in sorted(unknown_pdf_pages.items()):
+            print(f'    {filepath} ({reason})')
     print()
 
     # --- Setlists ------------------------------------------------------------
