@@ -1,4 +1,4 @@
-# forScore Backup Cleanup Tools
+# forScore Backup Cleanup and Migration to Mobilesheets Tools
 
 This is all about dealing with the forScore sheet reader app (iPadOS/iOS) issues relating to iCloud sync problems (producing thousands of bookmark duplicates under the hood) and options to clean up your forScore library and to extract, backup and/or transfer data to another sheet reader app like MobileSheets.
 
