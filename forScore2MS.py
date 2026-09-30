@@ -64,6 +64,7 @@ import plistlib
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -104,6 +105,66 @@ def get_pdf_page_count(pdf_path: Path) -> int:
     except Exception:
         pass
     return 0
+
+
+def get_pdf_page_size(pdf_path: Path, page: int = 1) -> tuple[float, float] | None:
+    """Return the PDF page dimensions in points, or Spotlight dimensions."""
+    if not pdf_path.is_file():
+        return None
+    try:
+        result = subprocess.run(
+            ['pdfinfo', '-f', str(page), '-l', str(page), str(pdf_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        match = re.search(
+            r'^Page(?:\s+\d+)?\s+size:\s+([\d.]+)\s+x\s+([\d.]+)\s+pts\b',
+            result.stdout,
+            re.MULTILINE,
+        )
+        if result.returncode == 0 and match:
+            width, height = map(float, match.groups())
+            if width > 0 and height > 0:
+                return width, height
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        result = subprocess.run(
+            ['mdls', '-name', 'kMDItemPageWidth', '-name', 'kMDItemPageHeight',
+             str(pdf_path)],
+            capture_output=True, text=True, timeout=5,
+        )
+        dimensions = {}
+        for line in result.stdout.splitlines():
+            name, _, value = line.partition('=')
+            value = value.strip()
+            if name.strip() in ('kMDItemPageWidth', 'kMDItemPageHeight') and value:
+                dimensions[name.strip()] = float(value)
+        width = dimensions.get('kMDItemPageWidth', 0)
+        height = dimensions.get('kMDItemPageHeight', 0)
+        if width > 0 and height > 0:
+            return width, height
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def extract_text_annotations(plist: dict) -> dict[str, list[tuple[int, dict]]]:
+    """Return visible, non-empty text annotations grouped by PDF filepath."""
+    annotations: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    for key, values in plist.items():
+        parts = key.rsplit('|', 2)
+        if len(parts) != 3 or parts[2] != 'textAnnotations' or not parts[1].isdigit():
+            continue
+        if not isinstance(values, list):
+            continue
+        for annotation in values:
+            if (isinstance(annotation, dict)
+                    and isinstance(annotation.get('text'), str)
+                    and annotation['text'].strip()
+                    and annotation.get('layerVisible', 1)):
+                annotations[parts[0]].append((int(parts[1]), annotation))
+    return annotations
 
 
 
@@ -637,7 +698,7 @@ CREATE TABLE IF NOT EXISTS Collections(Id INTEGER PRIMARY KEY,Name VARCHAR(255),
 CREATE TABLE IF NOT EXISTS CollectionSong(Id INTEGER PRIMARY KEY,CollectionId INTEGER,SongId INTEGER);
 CREATE INDEX IF NOT EXISTS col_col_id_idx ON CollectionSong(CollectionId);
 CREATE INDEX IF NOT EXISTS col_song_id_idx ON CollectionSong(SongId);
-CREATE TABLE IF NOT EXISTS Links(Id INTEGER PRIMARY KEY,SongId INTEGER,StartPointX FLOAT,StartPointY FLOAT,EndPointX FLOAT,EndPointY FLOAT,StartPage INTEGER,EndPage INTEGER,ZoomXStart FLOAT,ZoomYStart FLOAT,ZoomXEnd FLOAT,ZoomYEnd FLOAT,Radius INTEGER,Version INTEGER);
+CREATE TABLE IF NOT EXISTS Links(Id INTEGER PRIMARY KEY,SongId INTEGER,StartPointX FLOAT,StartPointY FLOAT,EndPointX FLOAT,EndPointY FLOAT,StartPage INTEGER,EndPage INTEGER,ZoomXStart FLOAT,ZoomYStart FLOAT,ZoomXEnd FLOAT,ZoomYEnd FLOAT,Radius INTEGER,Version INTEGER,Zoom FLOAT DEFAULT 0,ZoomEnd FLOAT);
 CREATE INDEX IF NOT EXISTS links_song_id_idx ON Links(SongId);
 CREATE TABLE IF NOT EXISTS AnnotationsBase(Id INTEGER PRIMARY KEY,SongId INTEGER,Page INTEGER,Type INTEGER,Opacity INTEGER,Zoom FLOAT,ZoomY FLOAT,Version INTEGER,SourcePageWidth FLOAT,SourcePageHeight FLOAT,Layer INTEGER);
 CREATE INDEX IF NOT EXISTS ann_song_id_idx ON AnnotationsBase(SongId);
@@ -647,7 +708,7 @@ CREATE TABLE IF NOT EXISTS DrawAnnotations(Id INTEGER PRIMARY KEY,BaseId INTEGER
 CREATE INDEX IF NOT EXISTS draw_ann_id_idx ON DrawAnnotations(BaseId);
 CREATE TABLE IF NOT EXISTS StampAnnotations(Id INTEGER PRIMARY KEY,BaseId INTEGER,Type INTEGER,Size FLOAT,FilePath VARCHAR(255),Color INTEGER,Font INTEGER,Symbol VARCHAR(255));
 CREATE INDEX IF NOT EXISTS stamp_ann_id_idx ON StampAnnotations(BaseId);
-CREATE TABLE IF NOT EXISTS TextboxAnnotations(Id INTEGER PRIMARY KEY,BaseId INTEGER,TextColor INTEGER,Text VARCHAR(255),FontFamily INTEGER,FontSize FLOAT,FontStyle INTEGER,FillColor INTEGER,BorderColor INTEGER,TextAlign INTEGER,HasBorder INTEGER,BorderWidth FLOAT,AutoSize INTEGER,LineSpacing FLOAT);
+CREATE TABLE IF NOT EXISTS TextboxAnnotations(Id INTEGER PRIMARY KEY,BaseId INTEGER,TextColor INTEGER,Text VARCHAR(255),FontFamily INTEGER,FontSize FLOAT,FontStyle INTEGER,FillColor INTEGER,BorderColor INTEGER,TextAlign INTEGER,HasBorder INTEGER,BorderWidth FLOAT,AutoSize INTEGER,LineSpacing FLOAT DEFAULT 1);
 CREATE INDEX IF NOT EXISTS tb_ann_id_idx ON TextboxAnnotations(BaseId);
 CREATE TABLE IF NOT EXISTS AnnotationPoints(Id INTEGER PRIMARY KEY,AnnotationId INTEGER,Points BLOB,Count INTEGER);
 CREATE INDEX IF NOT EXISTS ann_ann_id_idx ON AnnotationPoints(AnnotationId);
@@ -675,6 +736,7 @@ CREATE TABLE IF NOT EXISTS BatchMidiAction(Id INTEGER PRIMARY KEY,ParentId INTEG
 CREATE INDEX IF NOT EXISTS midi_action_commands_parent_id_idx ON BatchMidiAction(ParentId);
 CREATE TABLE IF NOT EXISTS MidiActionSysex(Id INTEGER PRIMARY KEY,MidiId INTEGER,SysexBytes BLOB);
 CREATE INDEX IF NOT EXISTS midi_action_sysex_midi_id_idx ON MidiActionSysex(MidiId);
+PRAGMA user_version = 63;
 """
 
 
@@ -720,6 +782,7 @@ class MobileSheetsDB:
         self._signatures:  dict[str, int] = {}
         self._setlists:    dict[str, int] = {}
         self._collections: dict[str, int] = {}
+        self._annotation_layers: set[tuple[int, int]] = set()
 
     # --- Lookup-or-create helpers -------------------------------------------
 
@@ -920,6 +983,61 @@ class MobileSheetsDB:
                 'INSERT INTO CollectionSong (CollectionId, SongId) VALUES (?, ?)',
                 (cid, song_id),
             )
+
+    def add_text_annotation(self, song_id: int, page: int, annotation: dict,
+                            page_size: tuple[float, float]) -> None:
+        """Insert a forScore text annotation as a MobileSheets textbox."""
+        layer_key = (song_id, page)
+        if layer_key not in self._annotation_layers:
+            self.cursor.execute(
+                """INSERT INTO Layers (SongId, Page, LayerIndex, Name, Visible)
+                   VALUES (?, ?, 0, 'Ebene 1', 1)""",
+                (song_id, page),
+            )
+            self._annotation_layers.add(layer_key)
+
+        page_width, page_height = page_size
+        x = float(annotation.get('origin.x', 0)) * page_width
+        y = float(annotation.get('origin.y', 0)) * page_height
+        width = max(0.0, float(annotation.get('size.x', 0)))
+        height = max(0.0, float(annotation.get('size.y', 0)))
+        font_size = float(annotation.get('fontSize', 16) or 16)
+        points = (x, y, x + width, y + height, x + 5.0, y + font_size)
+
+        color_names = {
+            'black': 0x000000, 'blue': 0x0000FF, 'cyan': 0x00FFFF,
+            'gray': 0x808080, 'grey': 0x808080, 'green': 0x00FF00,
+            'magenta': 0xFF00FF, 'orange': 0xFFA500, 'purple': 0x800080,
+            'red': 0xFF0000, 'white': 0xFFFFFF, 'yellow': 0xFFFF00,
+        }
+        raw_color = annotation.get('fontColor', 'Black')
+        if isinstance(raw_color, int):
+            text_color = raw_color & 0xFFFFFF
+        else:
+            text_color = color_names.get(str(raw_color).lower(), 0x000000)
+        text = annotation['text']
+
+        self.cursor.execute(
+            """INSERT INTO AnnotationsBase
+                   (SongId, Page, Type, Opacity, Zoom, ZoomY, Version,
+                    SourcePageWidth, SourcePageHeight, Layer)
+               VALUES (?, ?, 0, 255, 1, 1, 0, ?, ?, 0)""",
+            (song_id, page, page_width, page_height),
+        )
+        base_id = self.cursor.lastrowid
+        self.cursor.execute(
+            """INSERT INTO TextboxAnnotations
+                   (BaseId, TextColor, Text, FontFamily, FontSize, FontStyle,
+                    FillColor, BorderColor, TextAlign, HasBorder, BorderWidth,
+                    AutoSize, LineSpacing)
+                VALUES (?, ?, ?, 0, ?, ?, 0, 0, 0, 0, 0, 0, 1.00)""",
+            (base_id, text_color, text, font_size,
+             int(annotation.get('fontWeight', 0) or 0)),
+        )
+        self.cursor.execute(
+            'INSERT INTO AnnotationPoints (AnnotationId, Points, Count) VALUES (?, ?, ?)',
+            (base_id, struct.pack('<6d', *points), len(points)),
+        )
 
     def insert_midi_presets_as_smart_buttons(
         self,
@@ -1318,10 +1436,13 @@ def main():
     # --- Extract data --------------------------------------------------------
     print('Extracting songs and bookmarks...')
     songs = extract_songs_and_bookmarks(plist)
+    text_annotations = extract_text_annotations(plist)
+    annotation_count = sum(len(values) for values in text_annotations.values())
     n_bookmarks = sum(1 for s in songs if s['type'] == 'bookmark')
     n_singles   = sum(1 for s in songs if s['type'] == 'single')
     n_pdfs      = sum(1 for s in songs if s['type'] == 'pdf')
     print(f'  {len(songs):,} songs total  ({n_bookmarks:,} bookmarks, {n_singles:,} single PDFs, {n_pdfs:,} PDF files)')
+    print(f'  {annotation_count:,} visible text annotations across {len(text_annotations):,} PDF pages')
 
     print('Extracting setlists...')
     setlists = extract_setlists(plist)
@@ -1381,6 +1502,8 @@ def main():
     pdf_dir = (Path(args.pdf_dir).resolve() if args.pdf_dir
                else Path(args.input).resolve().with_suffix('') / 'files')
     pdf_page_counts: dict[str, int] = {}
+    pdf_page_sizes: dict[tuple[str, int], tuple[float, float] | None] = {}
+    annotation_size_missing: set[str] = set()
     unknown_pdf_pages: dict[str, str] = {}
     if not pdf_dir.is_dir():
         print(f'  Warning: PDF directory not found: {pdf_dir}')
@@ -1409,6 +1532,28 @@ def main():
             key     = (song['filepath'], song['title'])
             song_id_map[key] = song_id
 
+            source_page_end = song['last_page']
+            for source_page, annotation in text_annotations.get(filepath, []):
+                if source_page < song['first_page']:
+                    continue
+                if source_page_end != -1 and source_page > source_page_end:
+                    continue
+                page_size_key = (filepath, source_page)
+                if page_size_key not in pdf_page_sizes:
+                    pdf_page_sizes[page_size_key] = get_pdf_page_size(
+                        pdf_dir / filepath, source_page
+                    )
+                page_size = pdf_page_sizes[page_size_key]
+                if page_size is None:
+                    annotation_size_missing.add(filepath)
+                    continue
+                db.add_text_annotation(
+                    song_id,
+                    source_page - song['first_page'],
+                    annotation,
+                    page_size,
+                )
+
             # Preserve forScore library memberships as MobileSheets Collections.
             for library in song.get('libraries', []):
                 db.add_to_collection(library, song_id)
@@ -1433,6 +1578,10 @@ def main():
         print(f'  Warning: page count unavailable for {len(unknown_pdf_pages)} PDFs; metadata retained:')
         for filepath, reason in sorted(unknown_pdf_pages.items()):
             print(f'    {filepath} ({reason})')
+    if annotation_size_missing:
+        print(f'  Warning: skipped text annotations for {len(annotation_size_missing)} PDFs; page dimensions unavailable:')
+        for filepath in sorted(annotation_size_missing):
+            print(f'    {filepath}')
     print()
 
     # --- Setlists ------------------------------------------------------------

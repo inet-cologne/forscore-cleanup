@@ -168,7 +168,10 @@ python3 clean_forscore_bookmarks.py "Archiv 2026-04-12 16-00-52.4sb" --merge-met
 This script creates a MobileSheets database file from an `Archiv*.4sb` file.
 If you copy this file and the extracted files from script #2 to a fresh MobileSheets installation and switch in the app settings to the new library (the new database file), all songs and setlists with their metadata are available in MobileSheets — including audio links.
 
-Annotations are not yet included and will be added in an upcoming version.
+Visible forScore text annotations are imported as MobileSheets text boxes,
+including their page positions, sizes, font sizes, and supported text colors.
+Drawing annotations remain separate PNG files and are not imported into the
+MobileSheets database.
 
 ```bash
 python3 forScore2MS.py "Archiv 2026-04-12 16-00-52.4sb"
@@ -192,6 +195,10 @@ Collections. A PDF's collections are assigned to its bookmark songs and its
 whole-file entry; standalone PDF scores are assigned as well. The optional
 `--pdf-collection` adds an additional collection to whole-file entries.
 
+Text annotation positions use PDF page dimensions in points from `pdfinfo`
+(provided by Poppler) when available. On macOS, Spotlight metadata is used as a
+fallback if `pdfinfo` is unavailable; those dimensions may be less precise.
+
 **Options:**
 
 | Option | Description |
@@ -212,6 +219,7 @@ The button grid layout is computed automatically: the widest label determines th
 - Songs — every PDF with full metadata
 - Bookmarks — each becomes a virtual song (page-range slice of a PDF)
 - PDF files — each distinct PDF file gets an additional song entry with title = filename without extension
+- Text annotations — visible, non-empty per-page text boxes are attached to the matching song pages
 - Setlists — all setlists with song membership and display order
 - Audio links — linked MP3/M4A tracks
 - MIDI presets — as Smart Buttons (requires `--midi-presets`)

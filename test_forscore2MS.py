@@ -1,5 +1,6 @@
 import io
 import sqlite3
+import struct
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -138,6 +139,91 @@ class LibraryCollectionImportTests(unittest.TestCase):
             ('MSF-Big-Band', 'Tune'),
             ('Übungsmaterial', 'Solo score'),
         ])
+
+
+class TextAnnotationImportTests(unittest.TestCase):
+    def test_database_schema_matches_mobilesheets_version_63(self):
+        db = converter.MobileSheetsDB(':memory:')
+        try:
+            version = db.cursor.execute('PRAGMA user_version').fetchone()[0]
+            textbox_columns = {
+                row[1] for row in db.cursor.execute('PRAGMA table_info(TextboxAnnotations)')
+            }
+            link_columns = {
+                row[1] for row in db.cursor.execute('PRAGMA table_info(Links)')
+            }
+        finally:
+            db.close()
+
+        self.assertEqual(version, 63)
+        self.assertIn('LineSpacing', textbox_columns)
+        self.assertIn('Zoom', link_columns)
+        self.assertIn('ZoomEnd', link_columns)
+
+    def test_pdf_page_size_prefers_pdf_points_over_spotlight_dimensions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / 'score.pdf'
+            pdf_path.touch()
+            with patch.object(
+                    converter.subprocess, 'run',
+                    return_value=type('Result', (), {
+                        'returncode': 0,
+                        'stdout': 'Page size: 595 x 842 pts (A4)\n',
+                    })()) as run:
+                self.assertEqual(converter.get_pdf_page_size(pdf_path), (595, 842))
+            run.assert_called_once()
+
+    def test_extracts_visible_text_annotations_and_writes_mobile_sheets_rows(self):
+        plist = {
+            'Score.pdf|1|textAnnotations': [
+                {
+                    'text': 'Thema komplett nach Solo!\nSolo: ts, tp, p', 'origin.x': 0.1,
+                    'origin.y': 0.2, 'size.x': 200, 'size.y': 35,
+                    'fontSize': 16, 'fontColor': 'Red', 'layerVisible': 1,
+                },
+                {'text': 'hidden', 'layerVisible': 0},
+                {'text': '', 'layerVisible': 1},
+            ],
+        }
+        annotations = converter.extract_text_annotations(plist)
+        self.assertEqual(len(annotations['Score.pdf']), 1)
+
+        db = converter.MobileSheetsDB(':memory:')
+        try:
+            song_id = db.insert_song({
+                'title': 'Score', 'filepath': 'Score.pdf',
+                'first_page': 1, 'last_page': -1,
+            }, page_count=2)
+            db.add_text_annotation(song_id, 0, annotations['Score.pdf'][0][1], (528, 759))
+            base = db.cursor.execute(
+                'SELECT SongId, Page, Type, Opacity, SourcePageWidth, SourcePageHeight '
+                'FROM AnnotationsBase'
+            ).fetchone()
+            textbox = db.cursor.execute(
+                'SELECT TextColor, Text, FontSize, TextAlign, LineSpacing, '
+                'typeof(LineSpacing) '
+                'FROM TextboxAnnotations'
+            ).fetchone()
+            layers = db.cursor.execute(
+                'SELECT SongId, Page, LayerIndex, Name, Visible FROM Layers'
+            ).fetchall()
+            points, count = db.cursor.execute(
+                'SELECT Points, Count FROM AnnotationPoints'
+            ).fetchone()
+        finally:
+            db.close()
+
+        self.assertEqual(base, (song_id, 0, 0, 255, 528, 759))
+        self.assertEqual(
+            textbox,
+            (0xFF0000, 'Thema komplett nach Solo!\nSolo: ts, tp, p', 16, 0, 1.0, 'real'),
+        )
+        self.assertEqual(layers, [(song_id, 0, 0, 'Ebene 1', 1)])
+        self.assertEqual(count, 6)
+        for actual, expected in zip(
+                struct.unpack('<6d', points),
+            (52.8, 151.8, 252.8, 186.8, 57.8, 167.8)):
+            self.assertAlmostEqual(actual, expected)
 
 
 if __name__ == '__main__':
