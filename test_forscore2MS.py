@@ -105,5 +105,40 @@ class PageCountImportTests(unittest.TestCase):
             self.assertIn('Book.pdf (file missing)', output.getvalue())
 
 
+class LibraryCollectionImportTests(unittest.TestCase):
+    def test_library_memberships_become_collections_for_all_pdf_entries(self):
+        plist = {
+            'Book.pdf|bookmarks': [
+                {'Title': 'Tune'},
+            ],
+            'Book.pdf|libraries': 'MSF-Big-Band, Jazzlight',
+            'Solo.pdf|title': 'Solo score',
+            'Solo.pdf|libraries': 'Übungsmaterial',
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            with (patch.object(converter, 'validate_input'),
+                  patch.object(converter, 'read_plist_from_4sb', return_value=plist),
+                  patch.object(converter, 'get_pdf_page_count', return_value=0),
+                  patch('sys.argv', ['forScore2MS.py', 'archive.4sb', '-o', output_dir,
+                                     '--pdf-dir', output_dir]),
+                  redirect_stdout(io.StringIO())):
+                converter.main()
+
+            with sqlite3.connect(Path(output_dir) / 'mobilesheets.db') as connection:
+                rows = connection.execute(
+                    'SELECT c.Name, s.Title FROM Collections c '
+                    'JOIN CollectionSong cs ON cs.CollectionId = c.Id '
+                    'JOIN Songs s ON s.Id = cs.SongId ORDER BY c.Name, s.Title'
+                ).fetchall()
+
+        self.assertEqual(rows, [
+            ('Jazzlight', 'Book'),
+            ('Jazzlight', 'Tune'),
+            ('MSF-Big-Band', 'Book'),
+            ('MSF-Big-Band', 'Tune'),
+            ('Übungsmaterial', 'Solo score'),
+        ])
+
+
 if __name__ == '__main__':
     unittest.main()

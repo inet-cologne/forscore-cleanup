@@ -180,6 +180,22 @@ def decode_signature(value) -> str | None:
 # ---------------------------------------------------------------------------
 # plist extraction helpers
 # ---------------------------------------------------------------------------
+def _extract_libraries(plist: dict, filepath: str) -> list[str]:
+    value = plist.get(f'{filepath}|libraries', [])
+    if isinstance(value, str):
+        values = value.split(',')
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        return []
+    libraries = (
+        library.strip()
+        for value in values if isinstance(value, str)
+        for library in value.split(',')
+    )
+    return list(dict.fromkeys(library for library in libraries if library))
+
+
 def extract_songs_and_bookmarks(plist: dict) -> list:
     """
     Build a flat list of song dicts from the plist.
@@ -202,6 +218,7 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
         composer    - string or ''
         genre       - string or ''
         keyword     - string or ''
+        libraries   - list of forScore library names
         key         - decoded key string or None
         signature   - string or None
         bpm         - int or None
@@ -233,6 +250,7 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
                 'composer':   bm.get('Composer', '') or '',
                 'genre':      bm.get('Genre', '') or '',
                 'keyword':    bm.get('Keyword', '') or '',
+                'libraries':  _extract_libraries(plist, filepath),
                 'key':        decode_key(bm.get('Key')),
                 'signature':  decode_signature(bm.get('Signature')),
                 'bpm':        decode_bpm(bm.get('BPM')),
@@ -260,6 +278,7 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
             'composer':   plist.get(f'{filepath}|composer', '') or '',
             'genre':      plist.get(f'{filepath}|genre', '') or '',
             'keyword':    plist.get(f'{filepath}|keywords', '') or '',
+            'libraries':  _extract_libraries(plist, filepath),
             'key':        decode_key(plist.get(f'{filepath}|key')),
             'signature':  decode_signature(plist.get(f'{filepath}|signature')),
             'bpm':        decode_bpm(plist.get(f'{filepath}|bpm')),
@@ -283,6 +302,7 @@ def extract_songs_and_bookmarks(plist: dict) -> list:
             'composer':   plist.get(f'{filepath}|composer', '') or '',
             'genre':      plist.get(f'{filepath}|genre', '') or '',
             'keyword':    plist.get(f'{filepath}|keywords', '') or '',
+            'libraries':  _extract_libraries(plist, filepath),
             'key':        decode_key(plist.get(f'{filepath}|key')),
             'signature':  decode_signature(plist.get(f'{filepath}|signature')),
             'bpm':        decode_bpm(plist.get(f'{filepath}|bpm')),
@@ -1389,7 +1409,11 @@ def main():
             key     = (song['filepath'], song['title'])
             song_id_map[key] = song_id
 
-            # Add 'pdf' whole-file entries to the requested collection
+            # Preserve forScore library memberships as MobileSheets Collections.
+            for library in song.get('libraries', []):
+                db.add_to_collection(library, song_id)
+
+            # Optionally add 'pdf' whole-file entries to an extra collection.
             if song['type'] == 'pdf' and args.pdf_collection:
                 db.add_to_collection(args.pdf_collection, song_id)
 

@@ -137,7 +137,7 @@ Each PDF file gets a set of per-file metadata keys:
 | `<file>|reference`        | string     | External reference / link                        |
 | `<file>|version`          | int        | Internal version counter                         |
 | `<file>|printNumber`      | int        | Print number                                     |
-| `<file>|libraries`        | list       | Library membership                               |
+| `<file>|libraries`        | string/list | Comma-separated library memberships (or a list)  |
 
 #### Per-page metadata keys — `<filepath>|<page>|<property>`
 

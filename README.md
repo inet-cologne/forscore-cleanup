@@ -187,6 +187,11 @@ their full page range and bookmarks retain their own page ranges. Missing or
 unreadable PDFs are reported, but their songs and metadata are still imported
 with unknown page counts.
 
+forScore library memberships are transferred automatically to MobileSheets
+Collections. A PDF's collections are assigned to its bookmark songs and its
+whole-file entry; standalone PDF scores are assigned as well. The optional
+`--pdf-collection` adds an additional collection to whole-file entries.
+
 **Options:**
 
 | Option | Description |
