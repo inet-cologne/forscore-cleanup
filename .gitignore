@@ -1,5 +1,6 @@
 # forScore data files (personal data - not in repo)
 *.4sb
+*.4sl
 *.json
 *.plist
 *.db
@@ -26,6 +27,9 @@ mobilesheets_export/
 original/
 untouched/
 duplicated/
+*_diagnostics/
+*_previous/
+diagnostics_lesbar/
 db/
 csv/
 
