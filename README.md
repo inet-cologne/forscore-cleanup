@@ -243,6 +243,37 @@ The button grid layout is computed automatically: the widest label determines th
 
 ---
 
+### 5. `extract_forscore_diagnostics.py`
+
+Makes the forScore support/diagnostics files (`diagnostics.4sl`, `previous.4sl`) human-readable.
+You get these files in the app via **Tools → Support → Feedback & Support → Share diagnostics data**.
+
+A `.4sl` file is a gzip-compressed `NSKeyedArchiver` plist. It contains a small SQLite (Core Data) database with its `-shm`/`-wal` files plus the app preferences (`&SYS;…` / `&SYNC;…`). It is mainly a snapshot of the iCloud sync state, not your complete library, so it usually holds only a few items and setlists.
+
+```bash
+python3 extract_forscore_diagnostics.py diagnostics.4sl
+
+# Write the output folder somewhere else
+python3 extract_forscore_diagnostics.py diagnostics.4sl -o /path/to/dir
+
+# No argument or -h prints the help
+python3 extract_forscore_diagnostics.py -h
+```
+
+The output folder is created next to the input file and named `yyyy-mm-dd_hh-mm_<filename>` (timestamp = modification time of the `.4sl` file), e.g. `2026-11-05_12-14_diagnostics/`. An existing folder is never overwritten.
+
+| File | Content |
+|------|---------|
+| `<name>.sqlite` | Database with the WAL already merged |
+| `<name>.sql` | SQL dump (without indexes) |
+| `<name>.tables/` | One CSV per non-empty table |
+| `prefs.json` | App preferences (sync state, last sync date, use count, …) |
+| `summary.txt` | Overview: sync state, row counts, setlists, items, tracks, text annotations, tabs |
+
+Only the Python standard library is required.
+
+---
+
 ## Background
 
 The forScore iPad app (sheet music reader) maintains all metadata — bookmarks, setlists, annotations — within the app. When iCloud Sync is active, sync interruptions cause bookmarks to accumulate massive numbers of duplicates (up to 93% of all bookmarks can be duplicates in affected libraries). There are no built-in tools to remove them.
